@@ -1,5 +1,5 @@
 'use strict';
-// SMA-053: runs the extracted PostsRepository.markErrorUnlessDraft against a
+// SMA-053: runs the extracted PostsRepository.markErrorUnlessSettled against a
 // real PostgreSQL through Prisma. Synthetic data, network none.
 const assert = require('node:assert/strict');
 const { PrismaClient } = require('@prisma/client');
@@ -27,7 +27,7 @@ const mk = (id, state) =>
 const cases = [
   ['QUEUE post is marked ERROR with message and error row', async () => {
     await mk('p', 'QUEUE');
-    assert.equal(await repoOn(a).markErrorUnlessDraft('p', 'boom', [{ id: 'p' }]), true);
+    assert.equal(await repoOn(a).markErrorUnlessSettled('p', 'boom', [{ id: 'p' }]), true);
     const row = await a.post.findUnique({ where: { id: 'p' } });
     assert.equal(row.state, 'ERROR');
     assert.equal(row.error, 'boom');
@@ -35,21 +35,29 @@ const cases = [
   }],
   ['DRAFT post is left untouched, no error row', async () => {
     await mk('p', 'DRAFT');
-    assert.equal(await repoOn(a).markErrorUnlessDraft('p', 'boom', [{ id: 'p' }]), false);
+    assert.equal(await repoOn(a).markErrorUnlessSettled('p', 'boom', [{ id: 'p' }]), false);
     const row = await a.post.findUnique({ where: { id: 'p' } });
     assert.equal(row.state, 'DRAFT');
     assert.equal(row.error, null);
     assert.equal(await a.errors.count(), 0);
   }],
   ['missing post returns false', async () => {
-    assert.equal(await repoOn(a).markErrorUnlessDraft('nope', 'boom', []), false);
+    assert.equal(await repoOn(a).markErrorUnlessSettled('nope', 'boom', []), false);
   }],
   ['object error is stored as JSON, no body means no error row', async () => {
-    await mk('p', 'PUBLISHED');
-    assert.equal(await repoOn(a).markErrorUnlessDraft('p', { code: 1 }), true);
+    await mk('p', 'ERROR');
+    assert.equal(await repoOn(a).markErrorUnlessSettled('p', { code: 1 }), true);
     const row = await a.post.findUnique({ where: { id: 'p' } });
     assert.equal(row.state, 'ERROR');
     assert.equal(row.error, '{"code":1}');
+    assert.equal(await a.errors.count(), 0);
+  }],
+  ['PUBLISHED post stays PUBLISHED, no error row', async () => {
+    await mk('p', 'PUBLISHED');
+    assert.equal(await repoOn(a).markErrorUnlessSettled('p', 'comment failed', [{ id: 'p' }]), false);
+    const row = await a.post.findUnique({ where: { id: 'p' } });
+    assert.equal(row.state, 'PUBLISHED');
+    assert.equal(row.error, null);
     assert.equal(await a.errors.count(), 0);
   }],
   ['concurrent switch to DRAFT wins over a waiting ERROR write', async () => {
@@ -60,7 +68,7 @@ const cases = [
       await new Promise((r) => (released = r));
     }, { timeout: 20000 });
     await sleep(300);
-    const write = repoOn(b).markErrorUnlessDraft('p', 'late error', [{ id: 'p' }]);
+    const write = repoOn(b).markErrorUnlessSettled('p', 'late error', [{ id: 'p' }]);
     await sleep(700);
     released();
     await holding;

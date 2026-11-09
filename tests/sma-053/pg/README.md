@@ -6,5 +6,6 @@
    `sh /tmp/sma053-guard-pg/run.sh`.
 
 Both containers run with network none and synthetic data; the script removes
-them and the folder afterwards. 2026-11-09 on coder-dsh: 6/6 passed, including
-a concurrent DRAFT switch that wins over a waiting ERROR write.
+them and the folder afterwards. 2026-11-09 on coder-dsh: 7/7 passed, including
+a concurrent DRAFT switch that wins over a waiting ERROR write and a PUBLISHED
+post that is not overwritten.

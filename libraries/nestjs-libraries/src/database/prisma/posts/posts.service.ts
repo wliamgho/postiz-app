@@ -1373,8 +1373,8 @@ export class PostsService {
     return this._postRepository.changeState(id, state, err, body);
   }
 
-  async markErrorUnlessDraft(id: string, err?: any, body?: any) {
-    return this._postRepository.markErrorUnlessDraft(id, err, body);
+  async markErrorUnlessSettled(id: string, err?: any, body?: any) {
+    return this._postRepository.markErrorUnlessSettled(id, err, body);
   }
 
   async changePostStatus(

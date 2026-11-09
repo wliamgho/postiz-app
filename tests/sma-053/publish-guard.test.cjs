@@ -127,9 +127,9 @@ function build(rows) {
       rows[id] && rows[id].organizationId === org ? rows[id] : null,
     updateTags: async (_org, posts) => posts,
     updateMedia: async () => [],
-    markErrorUnlessDraft: async (id, err) => {
+    markErrorUnlessSettled: async (id, err) => {
       calls.error.push(id);
-      return rows[id]?.state !== 'DRAFT';
+      return !['DRAFT', 'PUBLISHED'].includes(rows[id]?.state);
     },
     changeState: async (id, state) => calls.state.push([id, state]),
   };

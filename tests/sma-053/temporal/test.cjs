@@ -112,9 +112,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     updateMedia: async () => [],
     updatePost: async (id) => setState(id, 'PUBLISHED'),
     changeState: async (id, state, err) => db.query('UPDATE posts SET state=$2, error=$3 WHERE id=$1', [id, state, err ? String(err) : null]),
-    // same predicate as PostsRepository.markErrorUnlessDraft (tested on Prisma in ../pg)
-    markErrorUnlessDraft: async (id, err) =>
-      (await db.query("UPDATE posts SET state='ERROR', error=$2 WHERE id=$1 AND state<>'DRAFT'", [id, err ? String(err).slice(0, 500) : null])).rowCount > 0,
+    // same predicate as PostsRepository.markErrorUnlessSettled (tested on Prisma in ../pg)
+    markErrorUnlessSettled: async (id, err) =>
+      (await db.query("UPDATE posts SET state='ERROR', error=$2 WHERE id=$1 AND state NOT IN ('DRAFT','PUBLISHED')", [id, err ? String(err).slice(0, 500) : null])).rowCount > 0,
   };
   const activity = new PostActivity(
     postService,
@@ -231,8 +231,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       assert.equal(counts.finalize, 1, 'only the root was published');
       assert.equal(counts.comment, 0);
       assert.equal((await row('reply')).state, 'DRAFT');
-      // known V112 behaviour on a comment failure: the live root is marked ERROR
-      console.log('  note: root state after reply stop =', (await row('root')).state);
+      // owner decision 2026-11-09: a live root stays PUBLISHED
+      assert.equal((await row('root')).state, 'PUBLISHED');
     }],
   ];
 

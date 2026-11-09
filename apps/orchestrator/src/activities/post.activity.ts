@@ -611,9 +611,10 @@ export class PostActivity {
   @ActivityMethod()
   async changeState(id: string, state: State, err?: any, body?: any) {
     // SMA-053: a workflow stopped by the publish guard must not overwrite the
-    // owner's DRAFT with ERROR. The skip is a single conditional write.
+    // owner's DRAFT with ERROR, and a failure after the root went live must
+    // not mark that live root ERROR. The skip is a single conditional write.
     if (state === State.ERROR) {
-      await this._postService.markErrorUnlessDraft(id, err, body);
+      await this._postService.markErrorUnlessSettled(id, err, body);
       return;
     }
     await this._postService.changeState(id, state, err, body);

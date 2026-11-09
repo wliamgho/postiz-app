@@ -545,9 +545,11 @@ export class PostsRepository {
     return update;
   }
 
-  // SMA-053: one conditional write, so a concurrent switch to DRAFT is never
-  // overwritten. Returns false when the post was DRAFT (or gone) and skipped.
-  async markErrorUnlessDraft(id: string, err?: any, body?: any) {
+  // SMA-053: one conditional write that never overwrites a settled post: the
+  // owner's DRAFT (a concurrent switch included) or a PUBLISHED post that is
+  // already live on the platform. Returns false when it skipped (or the post
+  // is gone).
+  async markErrorUnlessSettled(id: string, err?: any, body?: any) {
     const message =
       err === undefined || err === null
         ? undefined
@@ -556,7 +558,7 @@ export class PostsRepository {
         : JSON.stringify(err);
 
     const { count } = await this._post.model.post.updateMany({
-      where: { id, state: { not: 'DRAFT' } },
+      where: { id, state: { notIn: ['DRAFT', 'PUBLISHED'] } },
       data: { state: 'ERROR', ...(message ? { error: message } : {}) },
     });
     if (!count) {

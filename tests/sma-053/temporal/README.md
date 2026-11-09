@@ -13,6 +13,5 @@ the containers and the folder afterwards.
 
 2026-11-09 on coder-dsh: 5/5 passed — control publish; DRAFT during the
 scheduling sleep; DRAFT then worker restart (resumed history); DRAFT between
-container and finalize; reply set to DRAFT after the root went live. In the
-last case the live root ends as ERROR: existing V112 behaviour on a comment
-failure, not changed here.
+container and finalize; reply set to DRAFT after the root went live (the root
+stays PUBLISHED).
