@@ -19,3 +19,6 @@ export * from './streak.workflow';
 export * from './generate.video.workflow';
 export * from './process.media.workflow';
 export * from './clipping.workflow';
+
+// Experimental V113; no callers are routed to it.
+export * from './post-workflows/post.workflow.v1.1.3';

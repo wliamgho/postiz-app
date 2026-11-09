@@ -1,0 +1,36 @@
+'use strict';
+// Tests the actual V113 eligibility method with a fake PostsService.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ts = require('typescript');
+const source = fs.readFileSync(__dirname + '/post.activity.ts', 'utf8');
+const ast = ts.createSourceFile('post.activity.ts', source, ts.ScriptTarget.ES2020, true);
+const cls = ast.statements.find(s => ts.isClassDeclaration(s) && s.name?.text === 'PostActivity');
+const method = cls.members.find(m => m.name?.getText(ast) === 'isPublicationStillAllowedV113');
+assert(method, 'missing V113 method');
+const plain = method.getText(ast).replace(/^@ActivityMethod\(\)\s*/, '');
+const js = ts.transpileModule(`class Candidate { ${plain} }; Candidate;`, { compilerOptions:{ target:ts.ScriptTarget.ES2020 } }).outputText;
+const Candidate = vm.runInNewContext(js, {State:{QUEUE:'QUEUE',PUBLISHED:'PUBLISHED'}});
+const instance = new Candidate();
+const root={id:'root',organizationId:'org',state:'QUEUE',deletedAt:null};
+const reply={id:'reply',organizationId:'org',state:'QUEUE',parentPostId:'root',deletedAt:null};
+let rows={root,reply};
+instance._postService={getPostById:async(id,org)=>rows[id]?.organizationId===org?rows[id]:null};
+(async()=>{
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','root',false),true);
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','reply',false),false);
+  rows.root={...root,state:'PUBLISHED'};
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','reply',false),true);
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','root',true),true);
+  rows.root={...root,state:'DRAFT'};
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','reply',false),false);
+  rows.root={...root,state:'PUBLISHED'};rows.reply={...reply,state:'DRAFT'};
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','reply',false),false);
+  assert.equal(await instance.isPublicationStillAllowedV113('wrong','root','root',false),false);
+  rows.reply={...reply,parentPostId:'other'};
+  assert.equal(await instance.isPublicationStillAllowedV113('org','root','reply',false),false);
+  instance._postService={getPostById:async()=>{throw Error('database unavailable')}};
+  await assert.rejects(()=>instance.isPublicationStillAllowedV113('org','root','root',false),/database unavailable/);
+  console.log('PASS V113 eligibility: queue, published parent, draft, tenant, ancestry, DB failure');
+})().catch(e=>{console.error(e.stack);process.exitCode=1});

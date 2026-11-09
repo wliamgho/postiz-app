@@ -196,6 +196,24 @@ export class PostActivity {
     return [reanchorInterval(root), ...comments];
   }
 
+  // V113 only: a preflight check, not a lock across the provider request.
+  @ActivityMethod()
+  async isPublicationStillAllowedV113(
+    orgId: string,
+    rootId: string,
+    targetId: string,
+    postNow: boolean
+  ): Promise<boolean> {
+    const root = await this._postService.getPostById(rootId, orgId);
+    if (!root || root.deletedAt) return false;
+    if (targetId === rootId) {
+      return root.state === State.QUEUE || (postNow && root.state === State.PUBLISHED);
+    }
+    const target = await this._postService.getPostById(targetId, orgId);
+    return !!target && !target.deletedAt && target.parentPostId === rootId &&
+      root.state === State.PUBLISHED && target.state === State.QUEUE;
+  }
+
   @ActivityMethod()
   async isCommentable(integration: Integration) {
     const getIntegration = this._integrationManager.getSocialIntegration(
