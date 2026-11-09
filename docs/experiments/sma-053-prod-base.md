@@ -1,0 +1,13 @@
+# SMA-053 guard on the production source base — 2026-11-09 (draft, do not deploy)
+
+Branch `fix/sma-053-prod-base` starts at upstream `0d486f75` (2026-10-09), whose workflow, activity, posts service, posts repository and schema match the five source files captured from the running production image byte for byte. Three commits sit on it:
+
+1. The compiled production workflow guard, reconstructed in source: `patched('sma053-draft-state-guard-v1')`, post-sleep state checks, per-step `sma053CanProceed`, and the `sma053-revoked` result. The activity gets the unused third `postSocialPending` argument the compiled workflow passes. This is a reconstruction of observed behaviour, not proof of equivalence with the compiled output.
+2. The activity publish guard: before each provider request in `postSocial`/`postSocialPending`, `postComment` and `finalizePost`, the post and its ancestors must exist in the organization and be QUEUE or PUBLISHED; otherwise a non-retryable `bad_body` failure stops it. Pending data carries the post ids; data without them fails closed. Workflow ERROR writes use `markErrorUnlessSettled`, a single conditional update that skips DRAFT and PUBLISHED.
+3. Tests.
+
+Evidence (coder-dsh, disposable containers with network none, synthetic data): fake-service activity tests 15/15; PostgreSQL 16 through Prisma 6.5 7/7; real Temporal 9/9, which adds three cases that flip the post to DRAFT at the activity boundary, after the workflow's own check (root container, Threads finalize, reply), and a replay of four histories (with and without the patch marker, pending timer and completed) on this workflow. Replay covers the workflow only; activity code is not part of history. A fresh clone typechecks and `nest build` exits 0 for orchestrator and backend; the compiled workflow keeps the patch marker and the compiled activity the guard.
+
+Typecheck note: `tsc -p tsconfig.json` reports one more implicit-any error (autopost.service.ts:179, langgraph state) than the pure base (4 against 3). It disappears when either the workflow or the activity change is reverted, so it is an inference interaction, not a semantic one; `nest build` is unaffected. The frontend was not built.
+
+Still open: the milliseconds between the guard read and the provider request, and requests already in flight; reconciliation of old or unknown pending outcomes; a build identical to the production compiled output (this branch is a source reconstruction); independent review; owner decisions. The earlier branch `fix/sma-053-safe-drafts` is upstream-newer than production and keeps the V113 and cancellation experiments.
