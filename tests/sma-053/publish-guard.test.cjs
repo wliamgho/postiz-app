@@ -162,6 +162,16 @@ const cases = [
     await assert.rejects(activity.postSocialPending(integration, [post('root', 'QUEUE')]), isGuardStop);
     assert.equal(calls.pending, 0);
   }],
+  ['errored root never reaches provider (not looser than the compiled guard)', async () => {
+    const { activity, calls } = build({ root: post('root', 'ERROR') });
+    await assert.rejects(activity.postSocialPending(integration, [post('root', 'QUEUE')]), isGuardStop);
+    assert.equal(calls.pending, 0);
+  }],
+  ['published root may repeat (postNow chain)', async () => {
+    const { activity, calls } = build({ root: post('root', 'PUBLISHED') });
+    await activity.postSocialPending(integration, [post('root', 'QUEUE')]);
+    assert.equal(calls.pending, 1);
+  }],
   ['deleted root never reaches provider (blocking post path)', async () => {
     const { activity, calls } = build({ root: post('root', 'QUEUE', null, { deletedAt: new Date() }) });
     await assert.rejects(activity.postSocial(integration, [post('root', 'QUEUE')]), isGuardStop);

@@ -236,7 +236,8 @@ export class PostActivity {
   }
 
   // Throws a non-retryable bad_body failure when any post, or any of its
-  // ancestors, is missing, deleted, owned by another organization or DRAFT.
+  // ancestors, is missing, deleted, owned by another organization, or in a state
+// other than QUEUE or PUBLISHED (DRAFT and ERROR stop it).
   // Every workflow version stops on bad_body without re-running the publish.
   private async assertPublishable(
     integration: Integration,
@@ -268,8 +269,11 @@ export class PostActivity {
         if (!current || current.deletedAt) {
           throw reject('the post no longer exists');
         }
-        if (current.state === State.DRAFT) {
-          throw reject('the post is a draft');
+        // Only QUEUE (to be published) or PUBLISHED (a repeat run, or the live
+        // parent of a reply) may proceed. This is not looser than the guard
+        // already compiled into the running worker, which also stops ERROR.
+        if (current.state !== State.QUEUE && current.state !== State.PUBLISHED) {
+          throw reject(`the post is ${String(current.state).toLowerCase()}`);
         }
         currentId = current.parentPostId;
       }
