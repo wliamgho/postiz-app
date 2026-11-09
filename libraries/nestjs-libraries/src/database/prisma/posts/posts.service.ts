@@ -907,6 +907,30 @@ export class PostsService {
     orgId: string,
     state: State
   ) {
+    if (state === 'DRAFT') {
+      try {
+        const client = this._temporalService.client.getRawClient();
+        if (!client) throw new Error('Temporal client unavailable');
+        const workflows = client.workflow.list({
+          query: `postId="${postId}" AND ExecutionStatus="Running"`,
+        });
+        for await (const executionInfo of workflows) {
+          const workflow = await this._temporalService.client.getWorkflowHandle(
+            executionInfo.workflowId
+          );
+          if (!workflow) throw new Error('Workflow handle unavailable');
+          if ((await workflow.describe()).status.name !== 'TERMINATED') {
+            await workflow.terminate();
+          }
+        }
+      } catch (err) {
+        throw new Error(
+          'Draft saved, but workflow cancellation is unconfirmed; publication may be in flight'
+        );
+      }
+      return;
+    }
+
     try {
       const workflows = this._temporalService.client
         .getRawClient()
@@ -928,10 +952,6 @@ export class PostsService {
         } catch (err) {}
       }
     } catch (err) {}
-
-    if (state === 'DRAFT') {
-      return;
-    }
 
     try {
       await this._temporalService.client
@@ -1175,12 +1195,17 @@ export class PostsService {
       );
 
       if (body.type !== 'update') {
-        this.startWorkflow(
+        const workflow = this.startWorkflow(
           post.settings.__type.split('-')[0].toLowerCase(),
           posts[0].id,
           orgId,
           posts[0].state
-        ).catch((err) => {});
+        );
+        if (posts[0].state === 'DRAFT') {
+          await workflow;
+        } else {
+          workflow.catch((err) => {});
+        }
       }
 
       Sentry.metrics.count('post_created', 1);
@@ -1368,7 +1393,9 @@ export class PostsService {
         orgId,
         state
       );
-    } catch (err) {}
+    } catch (err) {
+      if (state === 'DRAFT') throw err;
+    }
 
     return { id, state };
   }
@@ -1406,7 +1433,9 @@ export class PostsService {
           orgId,
           getPostById.state === 'DRAFT' ? 'DRAFT' : 'QUEUE'
         );
-      } catch (err) {}
+      } catch (err) {
+        if (getPostById.state === 'DRAFT') throw err;
+      }
     }
 
     return newDate;

@@ -1,0 +1,9 @@
+const ts=require('typescript'),fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
+const p='libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts';
+const ast=ts.createSourceFile(p,fs.readFileSync(p,'utf8'),ts.ScriptTarget.ES2022,true);
+const cls=ast.statements.find(x=>ts.isClassDeclaration(x)&&x.name?.text==='PostsService');
+if(!cls)throw Error('PostsService missing');
+const methods=['startWorkflow','changePostStatus'].map(n=>{const m=cls.members.find(x=>x.name?.getText(ast)===n);if(!m)throw Error(n);return m.getText(ast)});
+const source=ts.transpileModule('class Candidate {'+methods.join('\n')+'}; Candidate;', {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+const C=vm.runInNewContext(source,{Error,TypedSearchAttributes:class{},postIdSearchParam:{},organizationId:{},BadRequestException:class extends Error{}});
+(async()=>{for(const fault of ['list','describe','terminate','missing','none']){let state='QUEUE',calls=0;const x=new C();x._postRepository={getPostById:async()=>({id:'fixture',integration:{providerIdentifier:'fake'}}),changeState:async(_,s)=>{state=s}}; x._temporalService={client:{getRawClient:()=>fault==='missing'?undefined:{workflow:{list:()=>({async *[Symbol.asyncIterator](){if(fault==='list')throw Error('list');yield {workflowId:'test'}}})}},getWorkflowHandle:async()=>({describe:async()=>{if(fault==='describe')throw Error('describe');return {status:{name:'RUNNING'}}},terminate:async()=>{if(fault==='terminate')throw Error('terminate');calls++}})}};let err;try{await x.changePostStatus('org','fixture','draft')}catch(e){err=e}assert.equal(state,'DRAFT');assert.equal(Boolean(err),fault!=='none',fault);if(err)assert.match(err.message,/cancellation is unconfirmed/);assert.equal(calls,fault==='none'?1:0);console.log('PASS',fault)} })().catch(e=>{console.error(e);process.exitCode=1});
