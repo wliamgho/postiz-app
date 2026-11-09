@@ -291,7 +291,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         ['marker-done', workflowsPath, true],
       ]) {
         const { history, id } = await record(label, wfPath, finish);
-        const marked = JSON.stringify(history).includes('sma053-draft-state-guard-v1');
+        // the SDK records a patch as a core_patch marker event whose id is the payload
+        const marked = history.events.some((e) => e.markerRecordedEventAttributes && e.markerRecordedEventAttributes.markerName === 'core_patch');
         await replay(history, id);
         stats.push(`${label}:${marked ? 'marker' : 'no-marker'}:ok`);
       }
