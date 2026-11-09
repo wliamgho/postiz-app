@@ -545,6 +545,49 @@ export class PostsRepository {
     return update;
   }
 
+  // SMA-053: one conditional write, so a concurrent switch to DRAFT is never
+  // overwritten. Returns false when the post was DRAFT (or gone) and skipped.
+  async markErrorUnlessDraft(id: string, err?: any, body?: any) {
+    const message =
+      err === undefined || err === null
+        ? undefined
+        : typeof err === 'string'
+        ? err
+        : JSON.stringify(err);
+
+    const { count } = await this._post.model.post.updateMany({
+      where: { id, state: { not: 'DRAFT' } },
+      data: { state: 'ERROR', ...(message ? { error: message } : {}) },
+    });
+    if (!count) {
+      return false;
+    }
+
+    if (message && body) {
+      try {
+        const post = await this._post.model.post.findUnique({
+          where: { id },
+          select: {
+            organizationId: true,
+            integration: { select: { providerIdentifier: true } },
+          },
+        });
+        if (post) {
+          await this._errors.model.errors.create({
+            data: {
+              message,
+              organizationId: post.organizationId,
+              platform: post.integration?.providerIdentifier,
+              postId: id,
+              body: typeof body === 'string' ? body : JSON.stringify(body),
+            },
+          });
+        }
+      } catch (e) {}
+    }
+    return true;
+  }
+
   getErrorsByPostIds(postIds: string[]) {
     return this._errors.model.errors.findMany({
       where: {

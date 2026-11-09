@@ -93,6 +93,27 @@ function reanchorInterval(post: any) {
   return { ...post, publishDate: new Date(next) };
 }
 
+// SMA-053: a post switched back to DRAFT (or deleted) while its workflow slept
+// still reached the provider, because the workflow only checks the state
+// before the scheduling sleep. Activity code is not part of workflow history,
+// so this guard also covers executions already running on older workflow
+// versions. It narrows the window to the moment before the provider request;
+// it cannot recall a request that is already in flight.
+const PUBLISH_GUARD_KEY = '__sma053Guard';
+const MAX_PARENT_DEPTH = 50;
+
+type PublishGuard = { orgId: string; postIds: string[] };
+
+function withPublishGuard(result: any, guard: PublishGuard) {
+  if (!result || typeof result !== 'object' || !result.pendingData) {
+    return result;
+  }
+  return {
+    ...result,
+    pendingData: { ...result.pendingData, [PUBLISH_GUARD_KEY]: guard },
+  };
+}
+
 @Injectable()
 @Activity()
 export class PostActivity {
@@ -214,6 +235,47 @@ export class PostActivity {
       root.state === State.PUBLISHED && target.state === State.QUEUE;
   }
 
+  // Throws a non-retryable bad_body failure when any post, or any of its
+  // ancestors, is missing, deleted, owned by another organization or DRAFT.
+  // Every workflow version stops on bad_body without re-running the publish.
+  private async assertPublishable(
+    integration: Integration,
+    orgId: string | undefined,
+    postIds: string[]
+  ) {
+    const reject = (reason: string) =>
+      new BadBody(
+        integration.providerIdentifier,
+        JSON.stringify({}),
+        Buffer.from('{}'),
+        `Publication stopped: ${reason} (SMA-053 guard)`
+      );
+
+    if (!orgId || !postIds.length) {
+      throw reject('the post could not be identified');
+    }
+
+    for (const postId of postIds) {
+      let currentId: string | null | undefined = postId;
+      for (let depth = 0; currentId; depth++) {
+        if (depth > MAX_PARENT_DEPTH) {
+          throw reject('the post chain is too deep');
+        }
+        const current: any = await this._postService.getPostById(
+          currentId,
+          orgId
+        );
+        if (!current || current.deletedAt) {
+          throw reject('the post no longer exists');
+        }
+        if (current.state === State.DRAFT) {
+          throw reject('the post is a draft');
+        }
+        currentId = current.parentPostId;
+      }
+    }
+  }
+
   @ActivityMethod()
   async isCommentable(integration: Integration) {
     const getIntegration = this._integrationManager.getSocialIntegration(
@@ -245,32 +307,42 @@ export class PostActivity {
           posts
         );
 
-        return getIntegration.comment(
+        const guard: PublishGuard = {
+          orgId: integration.organizationId,
+          postIds: (posts || []).map((p) => p.id),
+        };
+        const comments = await Promise.all(
+          (newPosts || []).map(async (p) => ({
+            id: p.id,
+            message: stripHtmlValidation(
+              getIntegration.editor,
+              p.content,
+              true,
+              false,
+              !/<\/?[a-z][\s\S]*>/i.test(p.content),
+              getIntegration.mentionFormat
+            ),
+            settings: JSON.parse(p.settings || '{}'),
+            media: await this._postService.updateMedia(
+              p.id,
+              JSON.parse(p.image || '[]'),
+              getIntegration?.convertToJPEG || false
+            ),
+          }))
+        );
+
+        // last check before the provider request (SMA-053)
+        await this.assertPublishable(integration, guard.orgId, guard.postIds);
+
+        const results = await getIntegration.comment(
           integration.internalId,
           postId,
           lastPostId,
           integration.token,
-          await Promise.all(
-            (newPosts || []).map(async (p) => ({
-              id: p.id,
-              message: stripHtmlValidation(
-                getIntegration.editor,
-                p.content,
-                true,
-                false,
-                !/<\/?[a-z][\s\S]*>/i.test(p.content),
-                getIntegration.mentionFormat
-              ),
-              settings: JSON.parse(p.settings || '{}'),
-              media: await this._postService.updateMedia(
-                p.id,
-                JSON.parse(p.image || '[]'),
-                getIntegration?.convertToJPEG || false
-              ),
-            }))
-          ),
+          comments,
           integration
         );
+        return (results || []).map((r: any) => withPublishGuard(r, guard));
       })
     );
   }
@@ -414,8 +486,16 @@ export class PostActivity {
       }))
     );
 
+    // last check before the provider request (SMA-053)
+    setHeartbeatDetails('publish guard');
+    const guard: PublishGuard = {
+      orgId: integration.organizationId,
+      postIds: (posts || []).map((p) => p.id),
+    };
+    await this.assertPublishable(integration, guard.orgId, guard.postIds);
+
     setHeartbeatDetails(`${integration.providerIdentifier}: publish`);
-    const postNow =
+    const published =
       allowPending && getIntegration.postPending
         ? await getIntegration.postPending(
             integration.internalId,
@@ -429,6 +509,9 @@ export class PostActivity {
             mappedPosts,
             integration
           );
+    const postNow = (published || []).map((r: any) =>
+      withPublishGuard(r, guard)
+    );
 
     // The post is already published at this point: the streak is best-effort,
     // failing the activity here would retry it and publish again.
@@ -462,21 +545,38 @@ export class PostActivity {
       integration.providerIdentifier
     );
 
-    return this.handleDisconnect(integration, () =>
+    const guard: PublishGuard | undefined = pendingData?.[PUBLISH_GUARD_KEY];
+    const result = await this.handleDisconnect(integration, () =>
       getIntegration.checkPostStatus(integration.token, pendingData, integration)
     );
+    // providers may return a new pendingData object: keep the guard on it
+    return guard ? withPublishGuard(result, guard) : result;
   }
 
+  // For pending providers (Threads among them) finalizePost is the actual
+  // publish, so it is guarded too. pendingData recorded before this guard
+  // existed carries no post ids: fail closed rather than publish blind.
   @ActivityMethod()
   async finalizePost(integration: Integration, pendingData: any) {
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
+    const guard: PublishGuard | undefined = pendingData?.[PUBLISH_GUARD_KEY];
 
     return withHeartbeat(() =>
-      this.handleDisconnect(integration, () =>
-        getIntegration.finalizePost(integration.token, pendingData, integration)
-      )
+      this.handleDisconnect(integration, async () => {
+        await this.assertPublishable(
+          integration,
+          guard?.orgId,
+          guard?.postIds || []
+        );
+        const result = await getIntegration.finalizePost(
+          integration.token,
+          pendingData,
+          integration
+        );
+        return withPublishGuard(result, guard as PublishGuard);
+      })
     );
   }
 
@@ -510,6 +610,12 @@ export class PostActivity {
 
   @ActivityMethod()
   async changeState(id: string, state: State, err?: any, body?: any) {
+    // SMA-053: a workflow stopped by the publish guard must not overwrite the
+    // owner's DRAFT with ERROR. The skip is a single conditional write.
+    if (state === State.ERROR) {
+      await this._postService.markErrorUnlessDraft(id, err, body);
+      return;
+    }
     await this._postService.changeState(id, state, err, body);
   }
 
