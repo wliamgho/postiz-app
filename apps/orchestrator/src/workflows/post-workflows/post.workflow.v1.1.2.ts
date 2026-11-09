@@ -7,6 +7,7 @@ import {
   sleep,
   defineSignal,
   setHandler,
+  patched,
 } from '@temporalio/workflow';
 import dayjs from 'dayjs';
 import { Integration } from '@prisma/client';
@@ -150,6 +151,7 @@ export async function postWorkflowV112({
   });
 
   // get all the posts and comments to post
+  const sma053Guard = patched('sma053-draft-state-guard-v1');
   const firstPost = await getPost(organizationId, postId);
 
   // in case doesn't exists for some reason, fail it
@@ -158,7 +160,10 @@ export async function postWorkflowV112({
     return;
   }
 
-  if (!postNow && firstPost.state !== 'QUEUE') {
+  if (sma053Guard && (firstPost.state === 'DRAFT' || (!postNow && firstPost.state !== 'QUEUE'))) {
+    return;
+  }
+  if (!sma053Guard && !postNow && firstPost.state !== 'QUEUE') {
     await changeState(firstPost.id, 'ERROR', 'Already posted', [firstPost]);
     return;
   }
@@ -184,6 +189,10 @@ export async function postWorkflowV112({
 
   if (!post) {
     await changeState(postId, 'ERROR', 'No Post');
+    return;
+  }
+
+  if (sma053Guard && (post.state === 'DRAFT' || (!postNow && post.state !== 'QUEUE'))) {
     return;
   }
 
@@ -331,6 +340,12 @@ export async function postWorkflowV112({
   // "pending": poll the read-only status check with durable timers until it
   // completes. Errors are fully handled here (never rethrown), otherwise they
   // would bubble to the posting retry loop and re-run the publish.
+  const sma053CanProceed = async (id: string) => {
+    const current = await getPostsList(organizationId, postId);
+    const target = current.find((item) => item.id === id);
+    return !!target && target.state !== 'DRAFT' && (postNow || target.state === 'QUEUE');
+  };
+
   const resolvePending = async (
     pending: PostResponse
   ): Promise<PostResponse | false> => {
@@ -355,6 +370,7 @@ export async function postWorkflowV112({
 
         // polling is done, run the remaining provider mutations
         if (result.status === 'ready') {
+          if (sma053Guard && !(await sma053CanProceed(pending.id))) return false;
           heartbeats = true;
           result = await finalizePost(post.integration, result.pendingData);
         }
@@ -437,11 +453,12 @@ export async function postWorkflowV112({
       try {
         // first post the main post
         if (i === 0) {
+          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) return false;
           heartbeats = true;
           postsResults.push(
             ...(await postSocialPending(post.integration as Integration, [
               postsList[i],
-            ]))
+            ], sma053Guard && postNow))
           );
 
           // then post the comments if any
@@ -450,6 +467,7 @@ export async function postWorkflowV112({
             await sleep(60000 * Math.max(0, Number(postsList[i].delay ?? 0)));
           }
 
+          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) return false;
           heartbeats = true;
           postsResults.push(
             ...(await postComment(
@@ -463,6 +481,7 @@ export async function postWorkflowV112({
           );
         }
 
+        if (sma053Guard && (postsResults[i] as { status: string })?.status === 'sma053-revoked') return false;
         posted = true;
 
         // the platform accepted the post but is still processing it: resolve
