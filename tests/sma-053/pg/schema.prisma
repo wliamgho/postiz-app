@@ -1,0 +1,47 @@
+// Minimal synthetic subset of the Postiz schema (State, Post, Integration,
+// Errors) for the SMA-053 conditional ERROR write test. Not a migration.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum State {
+  QUEUE
+  PUBLISHED
+  ERROR
+  DRAFT
+}
+
+model Integration {
+  id                 String @id
+  providerIdentifier String
+  posts              Post[]
+}
+
+model Post {
+  id             String      @id @default(cuid())
+  state          State       @default(QUEUE)
+  organizationId String
+  integrationId  String
+  parentPostId   String?
+  error          String?
+  deletedAt      DateTime?
+  integration    Integration @relation(fields: [integrationId], references: [id])
+  errors         Errors[]
+}
+
+model Errors {
+  id             String   @id @default(uuid())
+  message        String
+  platform       String
+  organizationId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  postId         String
+  body           String   @default("{}")
+  post           Post     @relation(fields: [postId], references: [id])
+}
