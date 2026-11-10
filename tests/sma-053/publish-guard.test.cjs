@@ -109,7 +109,8 @@ function build(rows) {
       return mapped.map((m) => ({ id: m.id, status: 'success', postId: 'p-' + m.id }));
     },
     // like threads: the reply's publish request runs inside the guard
-    comment: async (_i, _p, _l, _t, mapped, _int, publishGuard) => {
+    comment: async (_i, _p, _l, _t, mapped, _int, providerOption, publishGuard) => {
+      if (providerOption !== undefined) throw new Error('seventh comment argument must stay undefined');
       const publish = async () => {
         calls.comment++;
         return mapped.map((m) => ({ id: m.id, status: 'success', postId: 'r-' + m.id, releaseURL: 'https://example.invalid/r-' + m.id }));

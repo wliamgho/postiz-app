@@ -488,6 +488,8 @@ export class PostActivity {
           integration.token,
           comments,
           integration,
+          // seventh argument is provider-specific; keep its default
+          undefined,
           this.publishGuardFor(integration, guard)
         );
         await this.alertIfRevokedAfterPublish(integration, guard, results);

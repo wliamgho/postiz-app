@@ -101,7 +101,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     },
     // like threads: the reply container loads, then threads_publish runs
     // inside the publish guard and the reply is live at once
-    comment: async (_i, _p, _l, _t, mapped, _int, publishGuard) => {
+    comment: async (_i, _p, _l, _t, mapped, _int, providerOption, publishGuard) => {
+      if (providerOption !== undefined) throw new Error('seventh comment argument must stay undefined');
       if (hooks.beforeReplyPublish) await hooks.beforeReplyPublish();
       const publish = async () => {
         counts.comment++;

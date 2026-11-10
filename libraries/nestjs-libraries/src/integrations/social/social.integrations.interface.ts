@@ -120,6 +120,9 @@ export interface ISocialMediaIntegration {
     accessToken: string,
     postDetails: PostDetails[],
     integration: Integration,
+    // the seventh argument is provider-specific (LinkedIn account type,
+    // Instagram API host); callers pass undefined so defaults apply
+    providerOption?: any,
     publishGuard?: PublishGuard
   ): Promise<PostResponse[]>; // Schedules a new post
 }

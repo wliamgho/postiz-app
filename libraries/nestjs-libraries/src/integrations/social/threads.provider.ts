@@ -707,6 +707,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       thread_finisher: string;
     }>[],
     integration: Integration,
+    _providerOption?: unknown,
     publishGuard?: PublishGuard
   ): Promise<PostResponse[]> {
     if (!postDetails.length) {
