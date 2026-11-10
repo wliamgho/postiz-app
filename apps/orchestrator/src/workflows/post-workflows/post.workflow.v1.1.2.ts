@@ -152,6 +152,11 @@ export async function postWorkflowV112({
 
   // get all the posts and comments to post
   const sma053Guard = patched('sma053-draft-state-guard-v1');
+  // After an unknown error the publish loop marks the post ERROR and retries;
+  // sma053CanProceed must let that retry through. Behind its own patch, so
+  // histories recorded before it replay exactly as they ran.
+  const sma053RetryAfterError = patched('sma053-retry-after-error-v1');
+  let sma053OwnErrorWrite = false;
   const firstPost = await getPost(organizationId, postId);
 
   // in case doesn't exists for some reason, fail it
@@ -343,7 +348,13 @@ export async function postWorkflowV112({
   const sma053CanProceed = async (id: string) => {
     const current = await getPostsList(organizationId, postId);
     const target = current.find((item) => item.id === id);
-    return !!target && target.state !== 'DRAFT' && (postNow || target.state === 'QUEUE');
+    return (
+      !!target &&
+      target.state !== 'DRAFT' &&
+      (postNow ||
+        target.state === 'QUEUE' ||
+        (sma053OwnErrorWrite && target.state === 'ERROR'))
+    );
   };
 
   const resolvePending = async (
@@ -601,6 +612,12 @@ export async function postWorkflowV112({
             'fail'
           );
           return false;
+        }
+
+        // an unknown error: this run just marked the post ERROR and the loop
+        // retries the publish
+        if (sma053RetryAfterError) {
+          sma053OwnErrorWrite = true;
         }
       }
     }

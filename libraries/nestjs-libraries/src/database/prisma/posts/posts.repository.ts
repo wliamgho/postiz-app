@@ -592,7 +592,9 @@ export class PostsRepository {
       1,
       Math.floor(options.lockTimeoutMs ?? 3000)
     );
-    const transactionTimeoutMs = options.transactionTimeoutMs ?? 120000;
+    // caps how long an owner's save can wait behind a slow platform request;
+    // the request itself is not aborted (that could duplicate the post)
+    const transactionTimeoutMs = options.transactionTimeoutMs ?? 30000;
     const prisma = this._post.model as unknown as Pick<
       PrismaService,
       '$transaction'

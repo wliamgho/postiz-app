@@ -119,7 +119,8 @@ export interface ISocialMediaIntegration {
     lastCommentId: string | undefined,
     accessToken: string,
     postDetails: PostDetails[],
-    integration: Integration
+    integration: Integration,
+    publishGuard?: PublishGuard
   ): Promise<PostResponse[]>; // Schedules a new post
 }
 

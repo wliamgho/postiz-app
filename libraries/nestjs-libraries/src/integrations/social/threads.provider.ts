@@ -362,18 +362,25 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
   private async publishThread(
     userId: string,
     accessToken: string,
-    creationId: string
+    creationId: string,
+    publishGuard?: PublishGuard
   ): Promise<{ threadId: string; permalink: string }> {
     await this.checkLoaded(creationId, accessToken);
 
-    const { id: threadId } = await (
-      await this.fetch(
-        `https://graph.threads.net/v1.0/${userId}/threads_publish?creation_id=${creationId}&access_token=${accessToken}`,
-        {
-          method: 'POST',
-        }
-      )
-    ).json();
+    // SMA-053: threads_publish makes the reply public; run it inside the
+    // caller's publish guard (row lock and state re-check around this call)
+    const publish = async () =>
+      (
+        await this.fetch(
+          `https://graph.threads.net/v1.0/${userId}/threads_publish?creation_id=${creationId}&access_token=${accessToken}`,
+          {
+            method: 'POST',
+          }
+        )
+      ).json();
+    const { id: threadId } = await (publishGuard
+      ? publishGuard(publish)
+      : publish());
 
     const { permalink } = await (
       await this.fetch(
@@ -699,7 +706,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       active_thread_finisher: boolean;
       thread_finisher: string;
     }>[],
-    integration: Integration
+    integration: Integration,
+    publishGuard?: PublishGuard
   ): Promise<PostResponse[]> {
     if (!postDetails.length) {
       return [];
@@ -720,7 +728,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     const { threadId: replyThreadId, permalink } = await this.publishThread(
       userId,
       accessToken,
-      replyContentId
+      replyContentId,
+      publishGuard
     );
 
     return [

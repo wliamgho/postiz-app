@@ -105,6 +105,7 @@ function reanchorInterval(post: any) {
 // it cannot recall a request that is already in flight.
 const PUBLISH_GUARD_KEY = '__sma053Guard';
 const MAX_PARENT_DEPTH = 50;
+const PUBLISHABLE_STATES: string[] = [State.QUEUE, State.PUBLISHED, State.ERROR];
 
 type GuardIds = { orgId: string; postIds: string[] };
 
@@ -241,8 +242,7 @@ export class PostActivity {
   }
 
   // Throws a non-retryable bad_body failure when any post, or any of its
-  // ancestors, is missing, deleted, owned by another organization, or in a state
-  // other than QUEUE or PUBLISHED (DRAFT and ERROR stop it).
+  // ancestors, is missing, deleted, owned by another organization or DRAFT.
   // Every workflow version stops on bad_body without re-running the publish.
   private async assertPublishable(
     integration: Integration,
@@ -271,14 +271,27 @@ export class PostActivity {
         if (!current || current.deletedAt) {
           throw reject('the post no longer exists');
         }
-        // Only QUEUE (to be published) or PUBLISHED (a repeat run, or the live
-        // parent of a reply) may proceed. This is not looser than the guard
-        // already compiled into the running worker, which also stops ERROR.
-        if (current.state !== State.QUEUE && current.state !== State.PUBLISHED) {
+        // DRAFT stops it. ERROR may proceed: the workflow marks the post ERROR
+        // after an unknown error and then retries the publish, and the
+        // workflow itself decides at start whether an ERROR post may run.
+        if (!PUBLISHABLE_STATES.includes(current.state)) {
           throw reject(`the post is ${String(current.state).toLowerCase()}`);
         }
         currentId = current.parentPostId;
       }
+    }
+  }
+
+  // Plugs publish follow-up posts (for example an auto-reply) after the main
+  // post; the kill switch stops them too. bad_body ends only that plug.
+  private assertNoPublishHold(kind: string) {
+    if (publishHoldActive()) {
+      throw new BadBody(
+        kind,
+        JSON.stringify({}),
+        Buffer.from('{}'),
+        `Publication stopped on purpose (SMA-053 guard): publishing is on hold (PUBLISH_HOLD), ${kind} skipped. Nothing was published.`
+      );
     }
   }
 
@@ -316,7 +329,7 @@ export class PostActivity {
         if (current.deletedAt) {
           throw reject('the post no longer exists');
         }
-        if (current.state !== State.QUEUE && current.state !== State.PUBLISHED) {
+        if (!PUBLISHABLE_STATES.includes(current.state)) {
           throw reject(`the post is ${String(current.state).toLowerCase()}`);
         }
         if (!current.parentPostId) {
@@ -349,10 +362,11 @@ export class PostActivity {
           publish
         )
         .catch((err: any) => {
+          // Nothing was sent. A plain (retryable) error lets the workflow's
+          // own retry run the publish again instead of losing the post.
           if (err && err.name === 'PostChainLockError') {
-            throw this.guardStop(
-              integration,
-              'the post state could not be confirmed'
+            throw new Error(
+              `SMA-053 publish guard: post state not confirmed yet (${err.message}); nothing was published, retrying`
             );
           }
           throw err;
@@ -473,7 +487,8 @@ export class PostActivity {
           lastPostId,
           integration.token,
           comments,
-          integration
+          integration,
+          this.publishGuardFor(integration, guard)
         );
         await this.alertIfRevokedAfterPublish(integration, guard, results);
         return (results || []).map((r: any) => withPublishGuard(r, guard));
@@ -809,6 +824,7 @@ export class PostActivity {
     totalRuns: number;
     currentRun: number;
   }) {
+    this.assertNoPublishHold('plug');
     return this._integrationService.processPlugs(data);
   }
 
@@ -822,6 +838,7 @@ export class PostActivity {
     delay: number;
     information: any;
   }) {
+    this.assertNoPublishHold('internal plug');
     await this._integrationService.processInternalPlug(data);
   }
 
