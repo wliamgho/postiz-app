@@ -93,7 +93,7 @@ const post = (id, state, parentPostId = null, extra = {}) => ({
 });
 
 function build(rows) {
-  const calls = { post: 0, pending: 0, comment: 0, finalize: 0, lock: 0, error: [], state: [], notes: [] };
+  const calls = { post: 0, pending: 0, comment: 0, finalize: 0, lock: 0, plug: 0, error: [], state: [], notes: [] };
   const provider = {
     editor: 'normal',
     postPending: async (_i, _t, mapped) => {
@@ -108,13 +108,13 @@ function build(rows) {
       calls.post++;
       return mapped.map((m) => ({ id: m.id, status: 'success', postId: 'p-' + m.id }));
     },
-    comment: async (_i, _p, _l, _t, mapped) => {
-      calls.comment++;
-      return mapped.map((m) => ({
-        id: m.id,
-        status: 'pending',
-        pendingData: { step: 'container', containerId: 'c-' + m.id },
-      }));
+    // like threads: the reply's publish request runs inside the guard
+    comment: async (_i, _p, _l, _t, mapped, _int, publishGuard) => {
+      const publish = async () => {
+        calls.comment++;
+        return mapped.map((m) => ({ id: m.id, status: 'success', postId: 'r-' + m.id, releaseURL: 'https://example.invalid/r-' + m.id }));
+      };
+      return publishGuard ? publishGuard(publish) : publish();
     },
     // a provider that drops unknown keys, as threads does on the carousel step
     checkPostStatus: async (_t, pd) => ({
@@ -167,7 +167,7 @@ function build(rows) {
     postService,
     { inAppNotification: async (org, subject, message) => calls.notes.push(subject + ' | ' + message) },
     { getSocialIntegration: () => provider },
-    {},
+    { processPlugs: async () => { calls.plug++; }, processInternalPlug: async () => { calls.plug++; } },
     {},
     {},
     { client: { getRawClient: () => ({ workflow: { start: async () => undefined } }) } },
@@ -196,10 +196,10 @@ const cases = [
     await assert.rejects(activity.postSocialPending(integration, [post('root', 'QUEUE')]), isGuardStop);
     assert.equal(calls.pending, 0);
   }],
-  ['errored root never reaches provider (not looser than the compiled guard)', async () => {
+  ['errored root may reach the provider (the workflow retries after an unknown error)', async () => {
     const { activity, calls } = build({ root: post('root', 'ERROR') });
-    await assert.rejects(activity.postSocialPending(integration, [post('root', 'QUEUE')]), isGuardStop);
-    assert.equal(calls.pending, 0);
+    await activity.postSocialPending(integration, [post('root', 'QUEUE')]);
+    assert.equal(calls.pending, 1);
   }],
   ['published root may repeat (postNow chain)', async () => {
     const { activity, calls } = build({ root: post('root', 'PUBLISHED') });
@@ -230,7 +230,7 @@ const cases = [
     const { activity, calls } = build({ root: post('root', 'PUBLISHED'), reply: post('reply', 'QUEUE', 'root') });
     const [result] = await activity.postComment('live-root', undefined, integration, [post('reply', 'QUEUE')]);
     assert.equal(calls.comment, 1);
-    assert.deepEqual(result.pendingData.__sma053Guard.postIds, ['reply']);
+    assert.equal(result.status, 'success');
   }],
   ['status check keeps guard when provider returns new pendingData', async () => {
     const { activity } = build({ root: post('root', 'QUEUE') });
@@ -286,11 +286,38 @@ const cases = [
     await assert.rejects(activity.finalizePost(integration, guardData('reply')), isGuardStop);
     assert.equal(calls.finalize, 0);
   }],
-  ['lock failure fails closed with a guard stop', async () => {
+  ['lock failure sends nothing and stays retryable (not a bad_body stop)', async () => {
     const { activity, calls, hooks } = build({ root: post('root', 'QUEUE') });
     hooks.lockError = true;
-    await assert.rejects(activity.finalizePost(integration, guardData()), (e) => isGuardStop(e) && /could not be confirmed/.test(e.message));
+    await assert.rejects(activity.finalizePost(integration, guardData()), (e) => !(e instanceof BadBody) && /not confirmed yet/.test(e.message));
     assert.equal(calls.finalize, 0);
+  }],
+  ['reply turned DRAFT under the lock is not published', async () => {
+    const { activity, calls, rows, hooks } = build({ root: post('root', 'PUBLISHED'), reply: post('reply', 'QUEUE', 'root') });
+    hooks.beforeLock = async () => { rows.reply = { ...rows.reply, state: 'DRAFT' }; };
+    await assert.rejects(activity.postComment('live-root', undefined, integration, [post('reply', 'QUEUE')]), isGuardStop);
+    assert.equal(calls.lock, 1);
+    assert.equal(calls.comment, 0);
+  }],
+  ['queued reply is published inside the lock', async () => {
+    const { activity, calls } = build({ root: post('root', 'PUBLISHED'), reply: post('reply', 'QUEUE', 'root') });
+    const [r] = await activity.postComment('live-root', undefined, integration, [post('reply', 'QUEUE')]);
+    assert.equal(calls.lock, 1);
+    assert.equal(calls.comment, 1);
+    assert.equal(r.status, 'success');
+  }],
+  ['kill switch also stops plugs', async () => {
+    const { activity, calls } = build({});
+    sandboxProcess.env.PUBLISH_HOLD = '1';
+    try {
+      await assert.rejects(activity.processPlug({ plugId: 'p', postId: 'x', delay: 0, totalRuns: 1, currentRun: 1 }), (e) => e instanceof BadBody && /PUBLISH_HOLD/.test(e.message));
+      await assert.rejects(activity.processInternalPlug({ post: 'x', originalIntegration: 'a', integration: 'b', plugName: 'n', orgId: 'org', delay: 0, information: {} }), (e) => e instanceof BadBody);
+    } finally {
+      delete sandboxProcess.env.PUBLISH_HOLD;
+    }
+    assert.equal(calls.plug, 0);
+    await activity.processPlug({ plugId: 'p', postId: 'x', delay: 0, totalRuns: 1, currentRun: 1 });
+    assert.equal(calls.plug, 1);
   }],
   ['kill switch by environment stops every provider call', async () => {
     const { activity, calls } = build({ root: post('root', 'QUEUE') });

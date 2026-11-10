@@ -91,12 +91,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const provider = {
     editor: 'normal',
     postPending: async (_i, _t, mapped) => {
+      counts.containerAttempts = (counts.containerAttempts || 0) + 1;
+      if (hooks.failContainerOnce) {
+        hooks.failContainerOnce = false;
+        throw new Error('ECONNRESET (synthetic)');
+      }
       counts.container++;
       return mapped.map((m) => ({ id: m.id, status: 'pending', pendingData: { step: 'container', containerId: 'c-' + m.id } }));
     },
-    comment: async (_i, _p, _l, _t, mapped) => {
-      counts.comment++;
-      return mapped.map((m) => ({ id: m.id, status: 'pending', pendingData: { step: 'container', containerId: 'c-' + m.id } }));
+    // like threads: the reply container loads, then threads_publish runs
+    // inside the publish guard and the reply is live at once
+    comment: async (_i, _p, _l, _t, mapped, _int, publishGuard) => {
+      if (hooks.beforeReplyPublish) await hooks.beforeReplyPublish();
+      const publish = async () => {
+        counts.comment++;
+        return mapped.map((m) => ({ id: m.id, status: 'success', postId: 'live-r-' + m.id, releaseURL: 'https://example.invalid/r-' + m.id }));
+      };
+      return publishGuard ? publishGuard(publish) : publish();
     },
     // returns a fresh pendingData object, as threads does on the carousel step
     checkPostStatus: async (_t, pd) => {
@@ -318,6 +329,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }],
     ['histories recorded with and without the SMA-053 marker replay on this workflow', async () => {
       const origPath = path.join(dir, 'bundle/workflow-orig/post.workflow.v1.1.2.js');
+      const prodPath = path.join(dir, 'bundle/workflow-prod/post.workflow.v1.1.2.js');
       const replay = async (history, id) => {
         const r = await Worker.runReplayHistory({ workflowsPath }, history, id);
         return r;
@@ -341,16 +353,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       for (const [label, wfPath, finish] of [
         ['orig-timer', origPath, false],
         ['orig-done', origPath, true],
-        ['marker-timer', workflowsPath, false],
-        ['marker-done', workflowsPath, true],
+        ['prod-timer', prodPath, false],
+        ['prod-done', prodPath, true],
+        ['current-timer', workflowsPath, false],
+        ['current-done', workflowsPath, true],
       ]) {
         const { history, id } = await record(label, wfPath, finish);
         // the SDK records a patch as a core_patch marker event whose id is the payload
-        const marked = history.events.some((e) => e.markerRecordedEventAttributes && e.markerRecordedEventAttributes.markerName === 'core_patch');
+        const marked = history.events.filter((e) => e.markerRecordedEventAttributes && e.markerRecordedEventAttributes.markerName === 'core_patch').length;
         await replay(history, id);
-        stats.push(`${label}:${marked ? 'marker' : 'no-marker'}:ok`);
+        stats.push(`${label}:markers=${marked}:ok`);
       }
-      assert(stats.some((x) => x.includes(':marker:')) && stats.some((x) => x.includes(':no-marker:')));
+      // upstream 0, production 1 (draft guard), current 2 (+ retry after error)
+      assert.deepEqual(stats.map((x) => x.split(':')[1]), ['markers=0', 'markers=0', 'markers=1', 'markers=1', 'markers=2', 'markers=2']);
       console.log('  replayed', stats.join(' '));
     }],
     ['row lock: owner DRAFT sent during threads_publish waits until the request returns', async () => {
@@ -370,21 +385,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       assert(ownerDoneAt >= publishDoneAt, `owner write landed ${publishDoneAt - ownerDoneAt}ms inside the publish request`);
       console.log('  note: root state after workflow =', (await row('root')).state, '; alerts =', counts.alerts.length);
     }],
-    ['row lock: a lock held by someone else fails closed before publishing', async () => {
+    ['row lock: a lock held elsewhere sends nothing, then the publish is retried once', async () => {
       await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
       let holder;
+      let releasedAt = 0;
+      let publishedAt = 0;
       hooks.beforeFinalize = async () => {
         if (holder) return;
         const c = await pool.connect();
         await c.query('BEGIN');
         await c.query("SELECT id FROM posts WHERE id='root' FOR UPDATE");
-        holder = sleep(5000).then(() => c.query('COMMIT')).finally(() => c.release());
+        holder = sleep(5000)
+          .then(() => c.query('COMMIT'))
+          .then(() => { releasedAt = Date.now(); })
+          .finally(() => c.release());
       };
+      hooks.onFinalize = async () => { publishedAt = Date.now(); };
       const worker = await newWorker();
       await worker.runUntil(async () => (await start('lock-timeout')).result());
       await holder;
       assert.equal(counts.container, 1);
-      assert.equal(counts.finalize, 0);
+      assert.equal(counts.finalize, 1, 'published exactly once');
+      assert(publishedAt >= releasedAt, 'published while the other lock was still held');
+      assert.equal((await row('root')).state, 'PUBLISHED');
     }],
     ['kill switch file stops the publish and clears without a restart', async () => {
       const file = '/tmp/postiz-publish-hold';
@@ -404,6 +427,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const worker = await newWorker();
       await worker.runUntil(async () => (await start('hold-cleared')).result());
       assert.equal(counts.finalize, 1);
+    }],
+    ['temporary provider error on the first attempt is retried and published', async () => {
+      await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
+      hooks.failContainerOnce = true;
+      const worker = await newWorker();
+      await worker.runUntil(async () => (await start('retry-unknown')).result());
+      assert.equal(counts.containerAttempts, 2);
+      assert.equal(counts.finalize, 1);
+      assert.equal((await row('root')).state, 'PUBLISHED');
+    }],
+    ['reply turned DRAFT while its container loads is stopped under the lock', async () => {
+      await seed([
+        { id: 'root', state: 'QUEUE', inMs: 800 },
+        { id: 'reply', state: 'QUEUE', parent: 'root', inMs: 800 },
+      ]);
+      hooks.beforeReplyPublish = async () => setState('reply', 'DRAFT');
+      const worker = await newWorker();
+      await worker.runUntil(async () => (await start('reply-lock')).result());
+      assert.equal(counts.finalize, 1, 'root published');
+      assert.equal(counts.comment, 0, 'reply not published');
+      assert.equal((await row('reply')).state, 'DRAFT');
+      assert.equal((await row('root')).state, 'PUBLISHED');
     }],
   ];
 

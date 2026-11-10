@@ -39,15 +39,19 @@ fs.writeFileSync(
   path.join(out, 'workflow/post.workflow.v1.1.2.js'),
   shimmed(fs.readFileSync(path.join(root, WF), 'utf8'))
 );
-// The unmodified upstream workflow that production ran before the SMA-053
-// patch marker, for replaying histories recorded without it.
+// Older workflows for replay: the unmodified upstream workflow production ran
+// before the SMA-053 marker, and the workflow production runs now (its
+// compiled output is byte-identical to this commit's).
 const BASE = process.env.SMA053_BASE_COMMIT || '0d486f75';
-fs.mkdirSync(path.join(out, 'workflow-orig'), { recursive: true });
-fs.writeFileSync(
-  path.join(out, 'workflow-orig/post.workflow.v1.1.2.js'),
-  shimmed(execFileSync('git', ['show', `${BASE}:${WF}`], { cwd: root, encoding: 'utf8' }))
-);
-for (const d of ['workflow', 'workflow-orig'])
+const PROD = process.env.SMA053_PROD_COMMIT || 'a740a809';
+for (const [dirName, commit] of [['workflow-orig', BASE], ['workflow-prod', PROD]]) {
+  fs.mkdirSync(path.join(out, dirName), { recursive: true });
+  fs.writeFileSync(
+    path.join(out, dirName, 'post.workflow.v1.1.2.js'),
+    shimmed(execFileSync('git', ['show', `${commit}:${WF}`], { cwd: root, encoding: 'utf8' }))
+  );
+}
+for (const d of ['workflow', 'workflow-orig', 'workflow-prod'])
 fs.writeFileSync(
   path.join(out, d, 'shims.js'),
   `'use strict';
