@@ -4,7 +4,10 @@ import {
   NotFoundException,
   ValidationPipe,
 } from '@nestjs/common';
-import { PostsRepository } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
+import {
+  LockedPostRow,
+  PostsRepository,
+} from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
 import { CreatePostDto } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import dayjs from 'dayjs';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
@@ -1346,6 +1349,26 @@ export class PostsService {
 
   async changeState(id: string, state: State, err?: any, body?: any) {
     return this._postRepository.changeState(id, state, err, body);
+  }
+
+  async markErrorUnlessSettled(id: string, err?: any, body?: any) {
+    return this._postRepository.markErrorUnlessSettled(id, err, body);
+  }
+
+  withPostChainLocked<T>(
+    orgId: string,
+    postIds: string[],
+    check: (rows: LockedPostRow[]) => void,
+    publish: () => Promise<T>,
+    options?: { lockTimeoutMs?: number; transactionTimeoutMs?: number }
+  ): Promise<T> {
+    return this._postRepository.withPostChainLocked(
+      orgId,
+      postIds,
+      check,
+      publish,
+      options
+    );
   }
 
   async changePostStatus(

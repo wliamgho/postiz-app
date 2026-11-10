@@ -3,6 +3,7 @@ import { Integration } from '@prisma/client';
 import {
   AuthTokenDetails,
   PendingCheckResponse,
+  PublishGuard,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { ApplicationFailure } from '@temporalio/activity';
 import { setHeartbeatDetails } from '@gitroom/nestjs-libraries/temporal/temporal.heartbeat';
@@ -229,7 +230,8 @@ export abstract class SocialAbstract {
   public async finalizePost(
     accessToken: string,
     pendingData: any,
-    integration: Integration
+    integration: Integration,
+    publishGuard?: PublishGuard
   ): Promise<PendingCheckResponse> {
     throw new BadBody(
       this.identifier,

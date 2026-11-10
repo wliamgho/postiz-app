@@ -12,7 +12,12 @@ import {
 import { Integration, Post, State } from '@prisma/client';
 import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validation';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
-import { AuthTokenDetails } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import {
+  AuthTokenDetails,
+  PublishGuard,
+} from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import type { LockedPostRow } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
+import { existsSync } from 'fs';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -91,6 +96,47 @@ function reanchorInterval(post: any) {
     Math.ceil(late / interval) * interval;
 
   return { ...post, publishDate: new Date(next) };
+}
+
+// SMA-053: a post switched back to DRAFT (or deleted) while its workflow slept
+// still reached the provider, because the workflow only checks the state
+// before the scheduling sleep. Activity code is not part of workflow history,
+// so this guard also covers executions already running on older workflow
+// versions. It narrows the window to the moment before the provider request;
+// it cannot recall a request that is already in flight.
+const PUBLISH_GUARD_KEY = '__sma053Guard';
+const MAX_PARENT_DEPTH = 50;
+const PUBLISHABLE_STATES: string[] = [State.QUEUE, State.PUBLISHED, State.ERROR];
+
+type GuardIds = { orgId: string; postIds: string[] };
+
+// SMA-053 kill switch: PUBLISH_HOLD=true in the worker environment, or the
+// file PUBLISH_HOLD_FILE (default /tmp/postiz-publish-hold) existing inside
+// the worker container, makes every guarded provider call stop. The file can
+// be created or removed without a restart. Stopped posts end as ERROR and
+// must be rescheduled by the owner.
+function publishHoldActive(): boolean {
+  const flag = String(process.env.PUBLISH_HOLD || '').toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(flag)) {
+    return true;
+  }
+  try {
+    return existsSync(
+      process.env.PUBLISH_HOLD_FILE || '/tmp/postiz-publish-hold'
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+function withPublishGuard(result: any, guard: GuardIds) {
+  if (!result || typeof result !== 'object' || !result.pendingData) {
+    return result;
+  }
+  return {
+    ...result,
+    pendingData: { ...result.pendingData, [PUBLISH_GUARD_KEY]: guard },
+  };
 }
 
 @Injectable()
@@ -196,6 +242,188 @@ export class PostActivity {
     return [reanchorInterval(root), ...comments];
   }
 
+  // Throws a non-retryable bad_body failure when any post, or any of its
+  // ancestors, is missing, deleted, owned by another organization or DRAFT.
+  // Every workflow version stops on bad_body without re-running the publish.
+  private async assertPublishable(
+    integration: Integration,
+    orgId: string | undefined,
+    postIds: string[]
+  ) {
+    const reject = (reason: string) => this.guardStop(integration, reason);
+
+    if (publishHoldActive()) {
+      throw reject('publishing is on hold (PUBLISH_HOLD)');
+    }
+    if (!orgId || !postIds.length) {
+      throw reject('the post could not be identified');
+    }
+
+    for (const postId of postIds) {
+      let currentId: string | null | undefined = postId;
+      for (let depth = 0; currentId; depth++) {
+        if (depth > MAX_PARENT_DEPTH) {
+          throw reject('the post chain is too deep');
+        }
+        const current: any = await this._postService.getPostById(
+          currentId,
+          orgId
+        );
+        if (!current || current.deletedAt) {
+          throw reject('the post no longer exists');
+        }
+        // DRAFT stops it. ERROR may proceed: the workflow marks the post ERROR
+        // after an unknown error and then retries the publish, and the
+        // workflow itself decides at start whether an ERROR post may run.
+        if (!PUBLISHABLE_STATES.includes(current.state)) {
+          throw reject(`the post is ${String(current.state).toLowerCase()}`);
+        }
+        currentId = current.parentPostId;
+      }
+    }
+  }
+
+  // Plugs publish follow-up posts (for example an auto-reply) after the main
+  // post; the kill switch stops them too. bad_body ends only that plug.
+  private assertNoPublishHold(kind: string) {
+    if (publishHoldActive()) {
+      throw new BadBody(
+        kind,
+        JSON.stringify({}),
+        Buffer.from('{}'),
+        `Publication stopped on purpose (SMA-053 guard): publishing is on hold (PUBLISH_HOLD), ${kind} skipped. Nothing was published.`
+      );
+    }
+  }
+
+  // The text reaches the owner through the workflow's failure notification.
+  private guardStop(integration: Integration, reason: string) {
+    return new BadBody(
+      integration.providerIdentifier,
+      JSON.stringify({}),
+      Buffer.from('{}'),
+      `Publication stopped on purpose (SMA-053 guard): ${reason}. Nothing was published.`
+    );
+  }
+
+  // Same rules as assertPublishable, applied to the rows read under the
+  // publish lock, so the decision and the platform request see one state.
+  private checkLockedRows(
+    integration: Integration,
+    postIds: string[],
+    rows: LockedPostRow[]
+  ) {
+    const reject = (reason: string) => this.guardStop(integration, reason);
+    if (publishHoldActive()) {
+      throw reject('publishing is on hold (PUBLISH_HOLD)');
+    }
+    const byId = new Map((rows || []).map((row) => [row.id, row]));
+    for (const postId of postIds) {
+      let current = byId.get(postId);
+      if (!current) {
+        throw reject('the post no longer exists');
+      }
+      for (let depth = 0; current; depth++) {
+        if (depth > MAX_PARENT_DEPTH) {
+          throw reject('the post chain is too deep');
+        }
+        if (current.deletedAt) {
+          throw reject('the post no longer exists');
+        }
+        if (!PUBLISHABLE_STATES.includes(current.state)) {
+          throw reject(`the post is ${String(current.state).toLowerCase()}`);
+        }
+        if (!current.parentPostId) {
+          break;
+        }
+        const parent = byId.get(current.parentPostId);
+        if (!parent) {
+          throw reject('the post no longer exists');
+        }
+        current = parent;
+      }
+    }
+  }
+
+  // SMA-053: passed to providers that publish in finalizePost. The provider
+  // calls it around the one request that makes the post public; the post
+  // rows stay locked from the state check until that request returns, so an
+  // owner switching the post to DRAFT either lands first (and stops it) or
+  // waits until the request is done.
+  private publishGuardFor(
+    integration: Integration,
+    ids: GuardIds
+  ): PublishGuard {
+    return <T>(publish: () => Promise<T>) =>
+      this._postService
+        .withPostChainLocked(
+          ids.orgId,
+          ids.postIds,
+          (rows) => this.checkLockedRows(integration, ids.postIds, rows),
+          publish
+        )
+        .catch((err: any) => {
+          // Nothing was sent. A plain (retryable) error lets the workflow's
+          // own retry run the publish again instead of losing the post.
+          if (err && err.name === 'PostChainLockError') {
+            throw new Error(
+              `SMA-053 publish guard: post state not confirmed yet (${err.message}); nothing was published, retrying`
+            );
+          }
+          throw err;
+        });
+  }
+
+  // SMA-053: if a post went live but is now a draft or deleted (the owner's
+  // change waited behind the publish lock, or the provider has no guard),
+  // tell the owner right away so it can be corrected on the platform.
+  // Best-effort: never fails the activity after a successful publish.
+  private async alertIfRevokedAfterPublish(
+    integration: Integration,
+    ids: GuardIds | undefined,
+    results: any[]
+  ) {
+    try {
+      if (!ids) {
+        return;
+      }
+      const live = (results || []).filter(
+        (r) => r && (r.status === 'completed' || r.status === 'success')
+      );
+      if (!live.length) {
+        return;
+      }
+      for (const postId of ids.postIds) {
+        const post: any = await this._postService.getPostById(
+          postId,
+          ids.orgId
+        );
+        if (post && !post.deletedAt && post.state !== State.DRAFT) {
+          continue;
+        }
+        const urls = live
+          .map((r) => r.releaseURL)
+          .filter(Boolean)
+          .join(', ');
+        await this._notificationService.inAppNotification(
+          ids.orgId,
+          `A post went live after it was changed to draft`,
+          `A post on ${integration.providerIdentifier} for ${
+            integration.name
+          } was published but is now ${
+            !post || post.deletedAt ? 'deleted' : 'a draft'
+          }. Check it on the platform${urls ? `: ${urls}` : ''}. (SMA-053)`,
+          true,
+          false,
+          'fail'
+        );
+        return;
+      }
+    } catch (e) {
+      /**empty**/
+    }
+  }
+
   @ActivityMethod()
   async isCommentable(integration: Integration) {
     const getIntegration = this._integrationManager.getSocialIntegration(
@@ -227,32 +455,46 @@ export class PostActivity {
           posts
         );
 
-        return getIntegration.comment(
+        const guard: GuardIds = {
+          orgId: integration.organizationId,
+          postIds: (posts || []).map((p) => p.id),
+        };
+        const comments = await Promise.all(
+          (newPosts || []).map(async (p) => ({
+            id: p.id,
+            message: stripHtmlValidation(
+              getIntegration.editor,
+              p.content,
+              true,
+              false,
+              !/<\/?[a-z][\s\S]*>/i.test(p.content),
+              getIntegration.mentionFormat
+            ),
+            settings: JSON.parse(p.settings || '{}'),
+            media: await this._postService.updateMedia(
+              p.id,
+              JSON.parse(p.image || '[]'),
+              getIntegration?.convertToJPEG || false
+            ),
+          }))
+        );
+
+        // last check before the provider request (SMA-053)
+        await this.assertPublishable(integration, guard.orgId, guard.postIds);
+
+        const results = await getIntegration.comment(
           integration.internalId,
           postId,
           lastPostId,
           integration.token,
-          await Promise.all(
-            (newPosts || []).map(async (p) => ({
-              id: p.id,
-              message: stripHtmlValidation(
-                getIntegration.editor,
-                p.content,
-                true,
-                false,
-                !/<\/?[a-z][\s\S]*>/i.test(p.content),
-                getIntegration.mentionFormat
-              ),
-              settings: JSON.parse(p.settings || '{}'),
-              media: await this._postService.updateMedia(
-                p.id,
-                JSON.parse(p.image || '[]'),
-                getIntegration?.convertToJPEG || false
-              ),
-            }))
-          ),
-          integration
+          comments,
+          integration,
+          // seventh argument is provider-specific; keep its default
+          undefined,
+          this.publishGuardFor(integration, guard)
         );
+        await this.alertIfRevokedAfterPublish(integration, guard, results);
+        return (results || []).map((r: any) => withPublishGuard(r, guard));
       })
     );
   }
@@ -267,7 +509,14 @@ export class PostActivity {
   // finalizePost. Older workflow versions keep calling `postSocial` and get
   // the old blocking behavior.
   @ActivityMethod()
-  async postSocialPending(integration: Integration, posts: Post[]) {
+  // The third argument is passed by the compiled SMA-053 workflow guard
+  // (repeat run) and is accepted for signature compatibility only: the
+  // activity-side guard reads the post state itself.
+  async postSocialPending(
+    integration: Integration,
+    posts: Post[],
+    _sma053Repeat?: boolean
+  ) {
     return this.postSocialInternal(integration, posts, true);
   }
 
@@ -396,8 +645,16 @@ export class PostActivity {
       }))
     );
 
+    // last check before the provider request (SMA-053)
+    setHeartbeatDetails('publish guard');
+    const guard: GuardIds = {
+      orgId: integration.organizationId,
+      postIds: (posts || []).map((p) => p.id),
+    };
+    await this.assertPublishable(integration, guard.orgId, guard.postIds);
+
     setHeartbeatDetails(`${integration.providerIdentifier}: publish`);
-    const postNow =
+    const published =
       allowPending && getIntegration.postPending
         ? await getIntegration.postPending(
             integration.internalId,
@@ -411,6 +668,10 @@ export class PostActivity {
             mappedPosts,
             integration
           );
+    await this.alertIfRevokedAfterPublish(integration, guard, published);
+    const postNow = (published || []).map((r: any) =>
+      withPublishGuard(r, guard)
+    );
 
     // The post is already published at this point: the streak is best-effort,
     // failing the activity here would retry it and publish again.
@@ -444,21 +705,43 @@ export class PostActivity {
       integration.providerIdentifier
     );
 
-    return this.handleDisconnect(integration, () =>
+    const guard: GuardIds | undefined = pendingData?.[PUBLISH_GUARD_KEY];
+    const result = await this.handleDisconnect(integration, () =>
       getIntegration.checkPostStatus(integration.token, pendingData, integration)
     );
+    // providers may return a new pendingData object: keep the guard on it
+    return guard ? withPublishGuard(result, guard) : result;
   }
 
+  // For pending providers (Threads among them) finalizePost is the actual
+  // publish, so it is guarded too. pendingData recorded before this guard
+  // existed carries no post ids: fail closed rather than publish blind.
   @ActivityMethod()
   async finalizePost(integration: Integration, pendingData: any) {
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
+    const guard: GuardIds | undefined = pendingData?.[PUBLISH_GUARD_KEY];
 
     return withHeartbeat(() =>
-      this.handleDisconnect(integration, () =>
-        getIntegration.finalizePost(integration.token, pendingData, integration)
-      )
+      this.handleDisconnect(integration, async () => {
+        // cheap pre-check; the provider repeats it under the row lock around
+        // the request that makes the post public
+        await this.assertPublishable(
+          integration,
+          guard?.orgId,
+          guard?.postIds || []
+        );
+        const ids = guard as GuardIds;
+        const result = await getIntegration.finalizePost(
+          integration.token,
+          pendingData,
+          integration,
+          this.publishGuardFor(integration, ids)
+        );
+        await this.alertIfRevokedAfterPublish(integration, ids, [result]);
+        return withPublishGuard(result, ids);
+      })
     );
   }
 
@@ -492,6 +775,13 @@ export class PostActivity {
 
   @ActivityMethod()
   async changeState(id: string, state: State, err?: any, body?: any) {
+    // SMA-053: a workflow stopped by the publish guard must not overwrite the
+    // owner's DRAFT with ERROR, and a failure after the root went live must
+    // not mark that live root ERROR. The skip is a single conditional write.
+    if (state === State.ERROR) {
+      await this._postService.markErrorUnlessSettled(id, err, body);
+      return;
+    }
     await this._postService.changeState(id, state, err, body);
   }
 
@@ -559,6 +849,7 @@ export class PostActivity {
     totalRuns: number;
     currentRun: number;
   }) {
+    this.assertNoPublishHold('plug');
     return this._integrationService.processPlugs(data);
   }
 
@@ -572,6 +863,7 @@ export class PostActivity {
     delay: number;
     information: any;
   }) {
+    this.assertNoPublishHold('internal plug');
     await this._integrationService.processInternalPlug(data);
   }
 

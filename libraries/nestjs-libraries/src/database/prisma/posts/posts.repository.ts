@@ -1,4 +1,7 @@
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import {
+  PrismaRepository,
+  PrismaService,
+} from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable } from '@nestjs/common';
 import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import {
@@ -21,6 +24,27 @@ dayjs.extend(isoWeek);
 dayjs.extend(weekOfYear);
 dayjs.extend(isSameOrAfter);
 dayjs.extend(utc);
+
+// SMA-053: a post (or ancestor) row as seen under the publish lock.
+export type LockedPostRow = {
+  id: string;
+  state: string;
+  deletedAt: Date | null;
+  parentPostId: string | null;
+};
+
+// Raised when the publish lock could not be taken or the rows could not be
+// read (lock timeout, database error). Nothing has been sent to the platform.
+export class PostChainLockError extends Error {
+  constructor(public readonly lockCause: unknown) {
+    super(
+      `could not lock the post rows: ${
+        lockCause instanceof Error ? lockCause.message : String(lockCause)
+      }`
+    );
+    this.name = 'PostChainLockError';
+  }
+}
 
 @Injectable()
 export class PostsRepository {
@@ -543,6 +567,133 @@ export class PostsRepository {
     }
 
     return update;
+  }
+
+  // SMA-053: one conditional write that never overwrites a settled post: the
+  // owner's DRAFT (a concurrent switch included) or a PUBLISHED post that is
+  // already live on the platform. Returns false when it skipped (or the post
+  // is gone).
+  // SMA-053: runs `publish` while the posts and all their ancestors are
+  // row-locked FOR SHARE, after `check` approved the locked rows. A concurrent
+  // update of any of those rows (the owner switching one to DRAFT) waits until
+  // `publish` returns, so the state that was checked is the state at the
+  // moment of the platform request. Waiting for the lock is bounded; a lock
+  // or read failure raises PostChainLockError before anything is sent. Once
+  // `publish` ran, its result (or error) is returned even if the transaction
+  // itself fails afterwards: the platform has already seen the request.
+  async withPostChainLocked<T>(
+    orgId: string,
+    postIds: string[],
+    check: (rows: LockedPostRow[]) => void,
+    publish: () => Promise<T>,
+    options: { lockTimeoutMs?: number; transactionTimeoutMs?: number } = {}
+  ): Promise<T> {
+    const lockTimeoutMs = Math.max(
+      1,
+      Math.floor(options.lockTimeoutMs ?? 3000)
+    );
+    // caps how long an owner's save can wait behind a slow platform request;
+    // the request itself is not aborted (that could duplicate the post)
+    const transactionTimeoutMs = options.transactionTimeoutMs ?? 30000;
+    const prisma = this._post.model as unknown as Pick<
+      PrismaService,
+      '$transaction'
+    >;
+    const state: {
+      phase: 'lock' | 'check' | 'publish';
+      outcome?: { ok: true; value: T } | { ok: false; error: unknown };
+    } = { phase: 'lock' };
+
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRawUnsafe(
+            `SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`
+          );
+          const rows = await tx.$queryRaw<LockedPostRow[]>`
+            WITH RECURSIVE chain AS (
+              SELECT id, "parentPostId", 1 AS depth FROM "Post"
+              WHERE id = ANY(${postIds}::text[]) AND "organizationId" = ${orgId}
+              UNION
+              SELECT p.id, p."parentPostId", c.depth + 1 FROM "Post" p
+              JOIN chain c ON p.id = c."parentPostId"
+              WHERE p."organizationId" = ${orgId} AND c.depth < 50
+            )
+            SELECT p.id, p.state::text AS state, p."deletedAt", p."parentPostId"
+            FROM "Post" p
+            WHERE p.id IN (SELECT id FROM chain)
+            ORDER BY p.id
+            FOR SHARE OF p`;
+
+          state.phase = 'check';
+          check(rows);
+
+          state.phase = 'publish';
+          try {
+            state.outcome = { ok: true, value: await publish() };
+          } catch (error) {
+            state.outcome = { ok: false, error };
+          }
+        },
+        { maxWait: 5000, timeout: transactionTimeoutMs }
+      );
+    } catch (error) {
+      if (!state.outcome) {
+        if (state.phase === 'lock') {
+          throw new PostChainLockError(error);
+        }
+        throw error;
+      }
+    }
+
+    if (!state.outcome) {
+      throw new PostChainLockError(new Error('publish did not run'));
+    }
+    if (state.outcome.ok === false) {
+      throw state.outcome.error;
+    }
+    return state.outcome.value;
+  }
+
+  async markErrorUnlessSettled(id: string, err?: any, body?: any) {
+    const message =
+      err === undefined || err === null
+        ? undefined
+        : typeof err === 'string'
+        ? err
+        : JSON.stringify(err);
+
+    const { count } = await this._post.model.post.updateMany({
+      where: { id, state: { notIn: ['DRAFT', 'PUBLISHED'] } },
+      data: { state: 'ERROR', ...(message ? { error: message } : {}) },
+    });
+    if (!count) {
+      return false;
+    }
+
+    if (message && body) {
+      try {
+        const post = await this._post.model.post.findUnique({
+          where: { id },
+          select: {
+            organizationId: true,
+            integration: { select: { providerIdentifier: true } },
+          },
+        });
+        if (post) {
+          await this._errors.model.errors.create({
+            data: {
+              message,
+              organizationId: post.organizationId,
+              platform: post.integration?.providerIdentifier,
+              postId: id,
+              body: typeof body === 'string' ? body : JSON.stringify(body),
+            },
+          });
+        }
+      } catch (e) {}
+    }
+    return true;
   }
 
   getErrorsByPostIds(postIds: string[]) {

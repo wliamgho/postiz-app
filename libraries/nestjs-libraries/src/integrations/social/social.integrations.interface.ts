@@ -119,7 +119,11 @@ export interface ISocialMediaIntegration {
     lastCommentId: string | undefined,
     accessToken: string,
     postDetails: PostDetails[],
-    integration: Integration
+    integration: Integration,
+    // the seventh argument is provider-specific (LinkedIn account type,
+    // Instagram API host); callers pass undefined so defaults apply
+    providerOption?: any,
+    publishGuard?: PublishGuard
   ): Promise<PostResponse[]>; // Schedules a new post
 }
 
@@ -142,6 +146,11 @@ export type PostResponse = {
 // the mutations and duplicate the post. The only exception: when finalizePost's
 // mutation is idempotent (like setting a thumbnail), returning 'ready' again is
 // allowed, since re-running it cannot duplicate anything.
+// SMA-053: wraps the one platform request that makes a post public. The
+// caller holds a lock on the post rows and re-checks their state around
+// exactly that call; providers that publish in finalizePost should use it.
+export type PublishGuard = <T>(publish: () => Promise<T>) => Promise<T>;
+
 export type PendingCheckResponse =
   | { status: 'pending'; pendingData: any }
   | { status: 'ready'; pendingData: any }
@@ -204,7 +213,8 @@ export interface SocialProvider
   finalizePost(
     accessToken: string,
     pendingData: any,
-    integration: Integration
+    integration: Integration,
+    publishGuard?: PublishGuard
   ): Promise<PendingCheckResponse>;
   isWeb3?: boolean;
   isChromeExtension?: boolean;
