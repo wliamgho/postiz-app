@@ -370,7 +370,9 @@ export async function postWorkflowV112({
 
         // polling is done, run the remaining provider mutations
         if (result.status === 'ready') {
-          if (sma053Guard && !(await sma053CanProceed(pending.id))) return false;
+          if (sma053Guard && !(await sma053CanProceed(pending.id))) {
+            return false;
+          }
           heartbeats = true;
           result = await finalizePost(post.integration, result.pendingData);
         }
@@ -453,7 +455,9 @@ export async function postWorkflowV112({
       try {
         // first post the main post
         if (i === 0) {
-          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) return false;
+          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) {
+            return false;
+          }
           heartbeats = true;
           postsResults.push(
             ...(await postSocialPending(post.integration as Integration, [
@@ -467,7 +471,9 @@ export async function postWorkflowV112({
             await sleep(60000 * Math.max(0, Number(postsList[i].delay ?? 0)));
           }
 
-          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) return false;
+          if (sma053Guard && !(await sma053CanProceed(postsList[i].id))) {
+            return false;
+          }
           heartbeats = true;
           postsResults.push(
             ...(await postComment(
@@ -481,7 +487,9 @@ export async function postWorkflowV112({
           );
         }
 
-        if (sma053Guard && (postsResults[i] as { status: string })?.status === 'sma053-revoked') return false;
+        if (sma053Guard && (postsResults[i] as { status: string })?.status === 'sma053-revoked') {
+          return false;
+        }
         posted = true;
 
         // the platform accepted the post but is still processing it: resolve
