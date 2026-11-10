@@ -4,6 +4,7 @@ import {
   PendingCheckResponse,
   PostDetails,
   PostResponse,
+  PublishGuard,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
@@ -564,7 +565,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       containerId?: string;
       message?: string;
     },
-    integration: Integration
+    integration: Integration,
+    publishGuard?: PublishGuard
   ): Promise<PendingCheckResponse> {
     // the carousel children are processed: create the carousel container and
     // hand back to the workflow to wait for it (an orphan container from a
@@ -592,14 +594,21 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       };
     }
 
-    const { id: threadId } = await (
-      await this.fetch(
-        `https://graph.threads.net/v1.0/${integration.internalId}/threads_publish?creation_id=${pendingData.containerId}&access_token=${accessToken}`,
-        {
-          method: 'POST',
-        }
-      )
-    ).json();
+    // threads_publish is the request that makes the post public. SMA-053:
+    // run it inside the caller's publish guard, which locks the post rows and
+    // re-checks their state around exactly this call.
+    const publish = async () =>
+      (
+        await this.fetch(
+          `https://graph.threads.net/v1.0/${integration.internalId}/threads_publish?creation_id=${pendingData.containerId}&access_token=${accessToken}`,
+          {
+            method: 'POST',
+          }
+        )
+      ).json();
+    const { id: threadId } = await (publishGuard
+      ? publishGuard(publish)
+      : publish());
 
     return {
       status: 'completed',

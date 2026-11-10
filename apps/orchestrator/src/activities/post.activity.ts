@@ -12,7 +12,12 @@ import {
 import { Integration, Post, State } from '@prisma/client';
 import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validation';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
-import { AuthTokenDetails } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import {
+  AuthTokenDetails,
+  PublishGuard,
+} from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import type { LockedPostRow } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
+import { existsSync } from 'fs';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -101,9 +106,28 @@ function reanchorInterval(post: any) {
 const PUBLISH_GUARD_KEY = '__sma053Guard';
 const MAX_PARENT_DEPTH = 50;
 
-type PublishGuard = { orgId: string; postIds: string[] };
+type GuardIds = { orgId: string; postIds: string[] };
 
-function withPublishGuard(result: any, guard: PublishGuard) {
+// SMA-053 kill switch: PUBLISH_HOLD=true in the worker environment, or the
+// file PUBLISH_HOLD_FILE (default /tmp/postiz-publish-hold) existing inside
+// the worker container, makes every guarded provider call stop. The file can
+// be created or removed without a restart. Stopped posts end as ERROR and
+// must be rescheduled by the owner.
+function publishHoldActive(): boolean {
+  const flag = String(process.env.PUBLISH_HOLD || '').toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(flag)) {
+    return true;
+  }
+  try {
+    return existsSync(
+      process.env.PUBLISH_HOLD_FILE || '/tmp/postiz-publish-hold'
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+function withPublishGuard(result: any, guard: GuardIds) {
   if (!result || typeof result !== 'object' || !result.pendingData) {
     return result;
   }
@@ -225,14 +249,11 @@ export class PostActivity {
     orgId: string | undefined,
     postIds: string[]
   ) {
-    const reject = (reason: string) =>
-      new BadBody(
-        integration.providerIdentifier,
-        JSON.stringify({}),
-        Buffer.from('{}'),
-        `Publication stopped: ${reason} (SMA-053 guard)`
-      );
+    const reject = (reason: string) => this.guardStop(integration, reason);
 
+    if (publishHoldActive()) {
+      throw reject('publishing is on hold (PUBLISH_HOLD)');
+    }
     if (!orgId || !postIds.length) {
       throw reject('the post could not be identified');
     }
@@ -258,6 +279,133 @@ export class PostActivity {
         }
         currentId = current.parentPostId;
       }
+    }
+  }
+
+  // The text reaches the owner through the workflow's failure notification.
+  private guardStop(integration: Integration, reason: string) {
+    return new BadBody(
+      integration.providerIdentifier,
+      JSON.stringify({}),
+      Buffer.from('{}'),
+      `Publication stopped on purpose (SMA-053 guard): ${reason}. Nothing was published.`
+    );
+  }
+
+  // Same rules as assertPublishable, applied to the rows read under the
+  // publish lock, so the decision and the platform request see one state.
+  private checkLockedRows(
+    integration: Integration,
+    postIds: string[],
+    rows: LockedPostRow[]
+  ) {
+    const reject = (reason: string) => this.guardStop(integration, reason);
+    if (publishHoldActive()) {
+      throw reject('publishing is on hold (PUBLISH_HOLD)');
+    }
+    const byId = new Map((rows || []).map((row) => [row.id, row]));
+    for (const postId of postIds) {
+      let current = byId.get(postId);
+      if (!current) {
+        throw reject('the post no longer exists');
+      }
+      for (let depth = 0; current; depth++) {
+        if (depth > MAX_PARENT_DEPTH) {
+          throw reject('the post chain is too deep');
+        }
+        if (current.deletedAt) {
+          throw reject('the post no longer exists');
+        }
+        if (current.state !== State.QUEUE && current.state !== State.PUBLISHED) {
+          throw reject(`the post is ${String(current.state).toLowerCase()}`);
+        }
+        if (!current.parentPostId) {
+          break;
+        }
+        const parent = byId.get(current.parentPostId);
+        if (!parent) {
+          throw reject('the post no longer exists');
+        }
+        current = parent;
+      }
+    }
+  }
+
+  // SMA-053: passed to providers that publish in finalizePost. The provider
+  // calls it around the one request that makes the post public; the post
+  // rows stay locked from the state check until that request returns, so an
+  // owner switching the post to DRAFT either lands first (and stops it) or
+  // waits until the request is done.
+  private publishGuardFor(
+    integration: Integration,
+    ids: GuardIds
+  ): PublishGuard {
+    return <T>(publish: () => Promise<T>) =>
+      this._postService
+        .withPostChainLocked(
+          ids.orgId,
+          ids.postIds,
+          (rows) => this.checkLockedRows(integration, ids.postIds, rows),
+          publish
+        )
+        .catch((err: any) => {
+          if (err && err.name === 'PostChainLockError') {
+            throw this.guardStop(
+              integration,
+              'the post state could not be confirmed'
+            );
+          }
+          throw err;
+        });
+  }
+
+  // SMA-053: if a post went live but is now a draft or deleted (the owner's
+  // change waited behind the publish lock, or the provider has no guard),
+  // tell the owner right away so it can be corrected on the platform.
+  // Best-effort: never fails the activity after a successful publish.
+  private async alertIfRevokedAfterPublish(
+    integration: Integration,
+    ids: GuardIds | undefined,
+    results: any[]
+  ) {
+    try {
+      if (!ids) {
+        return;
+      }
+      const live = (results || []).filter(
+        (r) => r && (r.status === 'completed' || r.status === 'success')
+      );
+      if (!live.length) {
+        return;
+      }
+      for (const postId of ids.postIds) {
+        const post: any = await this._postService.getPostById(
+          postId,
+          ids.orgId
+        );
+        if (post && !post.deletedAt && post.state !== State.DRAFT) {
+          continue;
+        }
+        const urls = live
+          .map((r) => r.releaseURL)
+          .filter(Boolean)
+          .join(', ');
+        await this._notificationService.inAppNotification(
+          ids.orgId,
+          `A post went live after it was changed to draft`,
+          `A post on ${integration.providerIdentifier} for ${
+            integration.name
+          } was published but is now ${
+            !post || post.deletedAt ? 'deleted' : 'a draft'
+          }. Check it on the platform${urls ? `: ${urls}` : ''}. (SMA-053)`,
+          true,
+          false,
+          'fail'
+        );
+        return;
+      }
+    } catch (e) {
+      /**empty**/
     }
   }
 
@@ -292,7 +440,7 @@ export class PostActivity {
           posts
         );
 
-        const guard: PublishGuard = {
+        const guard: GuardIds = {
           orgId: integration.organizationId,
           postIds: (posts || []).map((p) => p.id),
         };
@@ -327,6 +475,7 @@ export class PostActivity {
           comments,
           integration
         );
+        await this.alertIfRevokedAfterPublish(integration, guard, results);
         return (results || []).map((r: any) => withPublishGuard(r, guard));
       })
     );
@@ -458,7 +607,7 @@ export class PostActivity {
 
     // last check before the provider request (SMA-053)
     setHeartbeatDetails('publish guard');
-    const guard: PublishGuard = {
+    const guard: GuardIds = {
       orgId: integration.organizationId,
       postIds: (posts || []).map((p) => p.id),
     };
@@ -479,6 +628,7 @@ export class PostActivity {
             mappedPosts,
             integration
           );
+    await this.alertIfRevokedAfterPublish(integration, guard, published);
     const postNow = (published || []).map((r: any) =>
       withPublishGuard(r, guard)
     );
@@ -515,7 +665,7 @@ export class PostActivity {
       integration.providerIdentifier
     );
 
-    const guard: PublishGuard | undefined = pendingData?.[PUBLISH_GUARD_KEY];
+    const guard: GuardIds | undefined = pendingData?.[PUBLISH_GUARD_KEY];
     const result = await this.handleDisconnect(integration, () =>
       getIntegration.checkPostStatus(integration.token, pendingData, integration)
     );
@@ -531,21 +681,26 @@ export class PostActivity {
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
-    const guard: PublishGuard | undefined = pendingData?.[PUBLISH_GUARD_KEY];
+    const guard: GuardIds | undefined = pendingData?.[PUBLISH_GUARD_KEY];
 
     return withHeartbeat(() =>
       this.handleDisconnect(integration, async () => {
+        // cheap pre-check; the provider repeats it under the row lock around
+        // the request that makes the post public
         await this.assertPublishable(
           integration,
           guard?.orgId,
           guard?.postIds || []
         );
+        const ids = guard as GuardIds;
         const result = await getIntegration.finalizePost(
           integration.token,
           pendingData,
-          integration
+          integration,
+          this.publishGuardFor(integration, ids)
         );
-        return withPublishGuard(result, guard as PublishGuard);
+        await this.alertIfRevokedAfterPublish(integration, ids, [result]);
+        return withPublishGuard(result, ids);
       })
     );
   }
