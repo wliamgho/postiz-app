@@ -54,14 +54,18 @@ const stubs = {
     organizationId: 'organizationId',
     postId: 'postId',
   },
+  fs: { existsSync: (p) => holdFiles.has(p) },
 };
+// kill switch inputs, shared with the sandbox
+const sandboxProcess = { env: {} };
+const holdFiles = new Set();
 const sandboxModule = { exports: {} };
 vm.runInNewContext(js, {
   module: sandboxModule,
   exports: sandboxModule.exports,
   require: (name) => stubs[name] || {},
   Buffer,
-  process: { env: {} },
+  process: sandboxProcess,
   JSON,
   Promise,
   Date,
@@ -89,7 +93,7 @@ const post = (id, state, parentPostId = null, extra = {}) => ({
 });
 
 function build(rows) {
-  const calls = { post: 0, pending: 0, comment: 0, finalize: 0, error: [], state: [] };
+  const calls = { post: 0, pending: 0, comment: 0, finalize: 0, lock: 0, error: [], state: [], notes: [] };
   const provider = {
     editor: 'normal',
     postPending: async (_i, _t, mapped) => {
@@ -117,14 +121,40 @@ function build(rows) {
       status: 'ready',
       pendingData: { step: pd.step, containerId: pd.containerId },
     }),
-    finalizePost: async (_t, pd) => {
-      calls.finalize++;
-      return { status: 'completed', postId: 'live-' + pd.containerId };
+    // like threads: only the publish request runs inside the guard
+    finalizePost: async (_t, pd, _i, publishGuard) => {
+      const publish = async () => {
+        calls.finalize++;
+        if (hooks.duringPublish) await hooks.duringPublish();
+        return { id: 'live-' + pd.containerId };
+      };
+      const { id } = await (publishGuard ? publishGuard(publish) : publish());
+      return { status: 'completed', postId: id, releaseURL: 'https://example.invalid/' + id };
     },
   };
+  const hooks = {};
   const postService = {
     getPostById: async (id, org) =>
       rows[id] && rows[id].organizationId === org ? rows[id] : null,
+    // in-memory stand-in for the row lock: hooks.beforeLock runs where a
+    // concurrent change could still land; the real lock is tested in ./pg
+    withPostChainLocked: async (org, ids, check, publish) => {
+      calls.lock++;
+      if (hooks.lockError) {
+        const e = new Error('lock timeout'); e.name = 'PostChainLockError'; throw e;
+      }
+      if (hooks.beforeLock) await hooks.beforeLock();
+      const chain = [];
+      const visit = (id) => {
+        const r = rows[id];
+        if (!r || r.organizationId !== org || chain.some((c) => c.id === id)) return;
+        chain.push({ id: r.id, state: r.state, deletedAt: r.deletedAt, parentPostId: r.parentPostId });
+        if (r.parentPostId) visit(r.parentPostId);
+      };
+      ids.forEach(visit);
+      check(chain);
+      return publish();
+    },
     updateTags: async (_org, posts) => posts,
     updateMedia: async () => [],
     markErrorUnlessSettled: async (id, err) => {
@@ -135,7 +165,7 @@ function build(rows) {
   };
   const activity = new PostActivity(
     postService,
-    {},
+    { inAppNotification: async (org, subject, message) => calls.notes.push(subject + ' | ' + message) },
     { getSocialIntegration: () => provider },
     {},
     {},
@@ -143,11 +173,15 @@ function build(rows) {
     { client: { getRawClient: () => ({ workflow: { start: async () => undefined } }) } },
     {}
   );
-  return { activity, calls, rows };
+  return { activity, calls, rows, hooks };
 }
 
 const isGuardStop = (err) =>
-  err instanceof BadBody && err.type === 'bad_body' && /SMA-053 guard/.test(err.message);
+  err instanceof BadBody &&
+  err.type === 'bad_body' &&
+  /SMA-053 guard/.test(err.message) &&
+  /Nothing was published/.test(err.message);
+const guardData = (id = 'root') => ({ step: 'container', containerId: 'c', __sma053Guard: { orgId: 'org', postIds: [id] } });
 
 const cases = [
   ['queued root reaches provider and carries guard', async () => {
@@ -232,6 +266,64 @@ const cases = [
     await activity.changeState('root', 'PUBLISHED');
     assert.deepEqual(calls.error, ['root']);
     assert.deepEqual(calls.state, [['root', 'PUBLISHED']]);
+  }],
+  ['finalize runs the publish request inside the row-lock guard', async () => {
+    const { activity, calls } = build({ root: post('root', 'QUEUE') });
+    const result = await activity.finalizePost(integration, guardData());
+    assert.equal(calls.lock, 1);
+    assert.equal(calls.finalize, 1);
+    assert.equal(result.status, 'completed');
+  }],
+  ['DRAFT that lands after the pre-check is caught under the lock', async () => {
+    const { activity, calls, rows, hooks } = build({ root: post('root', 'QUEUE') });
+    hooks.beforeLock = async () => { rows.root = { ...rows.root, state: 'DRAFT' }; };
+    await assert.rejects(activity.finalizePost(integration, guardData()), isGuardStop);
+    assert.equal(calls.finalize, 0);
+  }],
+  ['ancestor turned DRAFT under the lock stops a reply publish', async () => {
+    const { activity, calls, rows, hooks } = build({ root: post('root', 'PUBLISHED'), reply: post('reply', 'QUEUE', 'root') });
+    hooks.beforeLock = async () => { rows.root = { ...rows.root, state: 'DRAFT' }; };
+    await assert.rejects(activity.finalizePost(integration, guardData('reply')), isGuardStop);
+    assert.equal(calls.finalize, 0);
+  }],
+  ['lock failure fails closed with a guard stop', async () => {
+    const { activity, calls, hooks } = build({ root: post('root', 'QUEUE') });
+    hooks.lockError = true;
+    await assert.rejects(activity.finalizePost(integration, guardData()), (e) => isGuardStop(e) && /could not be confirmed/.test(e.message));
+    assert.equal(calls.finalize, 0);
+  }],
+  ['kill switch by environment stops every provider call', async () => {
+    const { activity, calls } = build({ root: post('root', 'QUEUE') });
+    sandboxProcess.env.PUBLISH_HOLD = 'true';
+    try {
+      await assert.rejects(activity.postSocialPending(integration, [post('root', 'QUEUE')]), (e) => isGuardStop(e) && /PUBLISH_HOLD/.test(e.message));
+      await assert.rejects(activity.finalizePost(integration, guardData()), isGuardStop);
+    } finally {
+      delete sandboxProcess.env.PUBLISH_HOLD;
+    }
+    assert.equal(calls.pending + calls.finalize, 0);
+  }],
+  ['kill switch by file stops calls and clears without a restart', async () => {
+    const { activity, calls } = build({ root: post('root', 'QUEUE') });
+    holdFiles.add('/tmp/postiz-publish-hold');
+    await assert.rejects(activity.finalizePost(integration, guardData()), isGuardStop);
+    holdFiles.delete('/tmp/postiz-publish-hold');
+    await activity.finalizePost(integration, guardData());
+    assert.equal(calls.finalize, 1);
+  }],
+  ['alert when the post is a draft right after it went live', async () => {
+    const { activity, calls, rows, hooks } = build({ root: post('root', 'QUEUE') });
+    hooks.duringPublish = async () => { rows.root = { ...rows.root, state: 'DRAFT' }; };
+    const result = await activity.finalizePost(integration, guardData());
+    assert.equal(result.status, 'completed');
+    assert.equal(calls.notes.length, 1);
+    assert.match(calls.notes[0], /went live after it was changed to draft/);
+    assert.match(calls.notes[0], /example\.invalid/);
+  }],
+  ['no alert when the post is still queued after publishing', async () => {
+    const { activity, calls } = build({ root: post('root', 'QUEUE') });
+    await activity.finalizePost(integration, guardData());
+    assert.equal(calls.notes.length, 0);
   }],
 ];
 

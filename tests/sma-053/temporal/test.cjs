@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const { Client: Pg } = require('pg');
+const { Client: Pg, Pool } = require('pg');
 const { Worker, NativeConnection } = require('@temporalio/worker');
 const { Connection, Client } = require('@temporalio/client');
 const { ApplicationFailure } = require('@temporalio/common');
@@ -34,6 +34,7 @@ const stubs = {
   },
   '@temporalio/common': { TypedSearchAttributes: class {} },
   '@gitroom/nestjs-libraries/temporal/temporal.search.attribute': { organizationId: 'organizationId', postId: 'postId' },
+  fs,
 };
 const mod = { exports: {} };
 vm.runInThisContext(`(function (module, exports, require) {\n${fs.readFileSync(path.join(dir, 'bundle/post.activity.js'), 'utf8')}\n})`)(
@@ -59,6 +60,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 (async () => {
   const db = new Pg({ host: '127.0.0.1', port: 5432, user: 'postgres', password: 'test', database: 'guard' });
   await db.connect();
+  // separate connections for the publish lock and for concurrent owner writes
+  const pool = new Pool({ host: '127.0.0.1', port: 5432, user: 'postgres', password: 'test', database: 'guard', max: 6 });
   await db.query(`CREATE TABLE posts (
     id text primary key, state text not null, parent text, deleted_at timestamptz,
     publish_date timestamptz not null, position int not null default 0, error text)`);
@@ -82,7 +85,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   let counts, hooks;
   const reset = () => {
-    counts = { container: 0, comment: 0, finalize: 0, notifications: [] };
+    counts = { container: 0, comment: 0, finalize: 0, notifications: [], alerts: [] };
     hooks = {};
   };
   const provider = {
@@ -100,10 +103,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       if (hooks.onCheck) await hooks.onCheck(pd);
       return { status: 'ready', pendingData: { step: pd.step, containerId: pd.containerId } };
     },
-    finalizePost: async (_t, pd) => {
-      counts.finalize++;
-      if (hooks.onFinalize) await hooks.onFinalize(pd);
-      return { status: 'completed', postId: 'live-' + pd.containerId, releaseURL: 'https://example.invalid/' + pd.containerId };
+    // like threads: only the publish request runs inside the publish guard
+    finalizePost: async (_t, pd, _i, publishGuard) => {
+      const publish = async () => {
+        counts.finalize++;
+        if (hooks.onFinalize) await hooks.onFinalize(pd);
+        return { id: 'live-' + pd.containerId };
+      };
+      const { id } = await (publishGuard ? publishGuard(publish) : publish());
+      return { status: 'completed', postId: id, releaseURL: 'https://example.invalid/' + pd.containerId };
     },
   };
   const postService = {
@@ -115,10 +123,52 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     // same predicate as PostsRepository.markErrorUnlessSettled (tested on Prisma in ../pg)
     markErrorUnlessSettled: async (id, err) =>
       (await db.query("UPDATE posts SET state='ERROR', error=$2 WHERE id=$1 AND state NOT IN ('DRAFT','PUBLISHED')", [id, err ? String(err).slice(0, 500) : null])).rowCount > 0,
+    // same SQL and phases as PostsRepository.withPostChainLocked (the Prisma
+    // version is tested in ../pg), on this test's table
+    withPostChainLocked: async (org, ids, check, publish, opts = {}) => {
+      const c = await pool.connect();
+      const st = { phase: 'lock' };
+      try {
+        await c.query('BEGIN');
+        await c.query(`SET LOCAL lock_timeout = '${Math.floor(opts.lockTimeoutMs || 3000)}ms'`);
+        const { rows } = await c.query(
+          `WITH RECURSIVE chain AS (
+             SELECT id, parent, 1 AS depth FROM posts WHERE id = ANY($1::text[])
+             UNION
+             SELECT p.id, p.parent, ch.depth + 1 FROM posts p JOIN chain ch ON p.id = ch.parent WHERE ch.depth < 50)
+           SELECT p.id, p.state, p.deleted_at AS "deletedAt", p.parent AS "parentPostId"
+           FROM posts p WHERE p.id IN (SELECT id FROM chain) ORDER BY p.id FOR SHARE OF p`,
+          [ids]
+        );
+        st.phase = 'check';
+        check(org === ORG ? rows : []);
+        st.phase = 'publish';
+        try {
+          st.outcome = { ok: true, value: await publish() };
+        } catch (error) {
+          st.outcome = { ok: false, error };
+        }
+        await c.query('COMMIT');
+      } catch (e) {
+        await c.query('ROLLBACK').catch(() => undefined);
+        if (!st.outcome) {
+          if (st.phase === 'lock') {
+            const err = new Error('could not lock the post rows: ' + e.message);
+            err.name = 'PostChainLockError';
+            throw err;
+          }
+          throw e;
+        }
+      } finally {
+        c.release();
+      }
+      if (!st.outcome.ok) throw st.outcome.error;
+      return st.outcome.value;
+    },
   };
   const activity = new PostActivity(
     postService,
-    {},
+    { inAppNotification: async (_o, subject) => counts.alerts.push(subject) },
     { getSocialIntegration: () => provider },
     {},
     {},
@@ -281,7 +331,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           if (finish) await handle.result();
           else await waitForTimer(handle);
         });
-        return { history: await handle.fetchHistory(), id: handle.workflowId };
+        const history = await handle.fetchHistory();
+        // do not leave a sleeping execution behind: it would wake up under the
+        // next case's worker and publish that case's synthetic post
+        if (!finish) await handle.terminate('SMA-053 test: history captured');
+        return { history, id: handle.workflowId };
       };
       const stats = [];
       for (const [label, wfPath, finish] of [
@@ -298,6 +352,58 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       }
       assert(stats.some((x) => x.includes(':marker:')) && stats.some((x) => x.includes(':no-marker:')));
       console.log('  replayed', stats.join(' '));
+    }],
+    ['row lock: owner DRAFT sent during threads_publish waits until the request returns', async () => {
+      await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
+      let ownerWrite;
+      let ownerDoneAt = 0;
+      let publishDoneAt = 0;
+      hooks.onFinalize = async () => {
+        ownerWrite = pool.query("UPDATE posts SET state='DRAFT' WHERE id='root'").then(() => { ownerDoneAt = Date.now(); });
+        await sleep(700);
+        publishDoneAt = Date.now();
+      };
+      const worker = await newWorker();
+      await worker.runUntil(async () => (await start('lock-wait')).result());
+      await ownerWrite;
+      assert.equal(counts.finalize, 1);
+      assert(ownerDoneAt >= publishDoneAt, `owner write landed ${publishDoneAt - ownerDoneAt}ms inside the publish request`);
+      console.log('  note: root state after workflow =', (await row('root')).state, '; alerts =', counts.alerts.length);
+    }],
+    ['row lock: a lock held by someone else fails closed before publishing', async () => {
+      await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
+      let holder;
+      hooks.beforeFinalize = async () => {
+        if (holder) return;
+        const c = await pool.connect();
+        await c.query('BEGIN');
+        await c.query("SELECT id FROM posts WHERE id='root' FOR UPDATE");
+        holder = sleep(5000).then(() => c.query('COMMIT')).finally(() => c.release());
+      };
+      const worker = await newWorker();
+      await worker.runUntil(async () => (await start('lock-timeout')).result());
+      await holder;
+      assert.equal(counts.container, 1);
+      assert.equal(counts.finalize, 0);
+    }],
+    ['kill switch file stops the publish and clears without a restart', async () => {
+      const file = '/tmp/postiz-publish-hold';
+      await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
+      fs.writeFileSync(file, '');
+      try {
+        const worker = await newWorker();
+        await worker.runUntil(async () => (await start('hold')).result());
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+      assert.equal(counts.container + counts.finalize, 0);
+      // stopped posts end as ERROR and must be rescheduled
+      assert.equal((await row('root')).state, 'ERROR');
+      reset();
+      await seed([{ id: 'root', state: 'QUEUE', inMs: 800 }]);
+      const worker = await newWorker();
+      await worker.runUntil(async () => (await start('hold-cleared')).result());
+      assert.equal(counts.finalize, 1);
     }],
   ];
 
@@ -316,6 +422,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await native.close();
   await connection.close();
   await db.end();
+  await pool.end();
   process.exit(failed ? 1 : 0);
 })().catch((e) => {
   console.error(e && e.stack);
