@@ -32,3 +32,18 @@ Production runs image `postiz:sma053-worker-v2-20261105`. Its compiled files wer
 - **Libraries:** repository, posts service, `social.abstract` and the Threads provider differ from production only by this branch's additions.
 
 Not done in this step: building a full Postiz image (the type-guard derived image and this compiled orchestrator would be combined on the production host at deploy time, as on 2026-11-05) and running the draft-safety verifier against it.
+
+## Independent review and fixes — 2026-11-10
+
+A separate reviewer agent read the diff without the author's conclusions. Each finding was checked against the code before acting:
+
+- **High, fixed — retry after a transient error was lost (also true of the running production worker).** On an unknown error V112 marks the root ERROR and loops to retry; the compiled `sma053CanProceed` and the activity guard both refused ERROR, so the retry never ran. Fix: the activity guard allows QUEUE, PUBLISHED and ERROR (DRAFT, deleted, missing and other-organization posts still stop), and the workflow lets its own retry through behind a new patch, `sma053-retry-after-error-v1`, set only after this run wrote the ERROR. Histories recorded before the patch replay exactly as they ran. The workflow is therefore no longer byte-identical to production; replay of histories from upstream, production and this version (0, 1 and 2 markers) passes.
+- **Medium, fixed — Threads replies bypassed the lock.** Replies publish in `comment()` → `publishThread()` → `threads_publish` after container polling, not in `finalizePost`. `comment()` now receives the publish guard and wraps that request.
+- **Medium, fixed — a lock failure lost the post.** Lock timeouts, pool waits and deadlocks now raise a retryable error (nothing was sent), so the workflow retries instead of ending the post as ERROR.
+- **Medium, fixed — long lock holds.** The transaction cap is 30 s instead of 120 s; the platform request is not aborted, because aborting could duplicate the post.
+- **Medium, fixed — plugs ignored the kill switch.** `processPlug` and `processInternalPlug` stop when `PUBLISH_HOLD` is active.
+- **Low, accepted and documented:** pending data from the old worker fails closed (deploy note: check for Threads posts between container and finalize before switching); the post-publish alert can miss when the owner's update commits after the read; providers other than Threads keep only the activity pre-check; the dead `sma053-revoked` branch and unused third argument stay for parity; a timeout right after the guard step shows "couldn't confirm".
+
+Re-run after the fixes: activity tests with fake services 26/26; PostgreSQL with Prisma 14/14; real Temporal 14/14, adding a transient provider error that is retried and published once, a reply turned DRAFT while its container loads, a lock held elsewhere that sends nothing and then publishes once after release, and replay of production-recorded histories.
+
+**Found by typecheck after the review fixes, fixed (`55e00dd9`):** passing the guard as the seventh `comment()` argument collided with provider-specific seventh parameters (Instagram API host, LinkedIn account type), so an Instagram or LinkedIn reply would have received the guard function as its host or account type. The guard now goes eighth, and the seventh is passed as `undefined` so those defaults apply exactly as before. `nest build` exited 0 even with these type errors, because the Postiz build does not type-check: `tsc --noEmit` must be part of every qualification. Final typecheck: orchestrator 4 and backend 7 errors, stable over three runs; the extra ones against the pure base are implicit-any errors in untouched langgraph files (an inference interaction), none in changed files.
