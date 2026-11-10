@@ -22,3 +22,13 @@ Still open: the milliseconds between the guard read and the provider request, an
 Evidence (coder-dsh, network none, synthetic data): activity tests with fake services 23/23; PostgreSQL 16 with Prisma 6.5 14/14, including an owner DRAFT update that waits for the request, a lock held elsewhere timing out without a publish, ancestors locked with a reply, and a result surviving a transaction timeout; real Temporal 12/12, including the lock wait end to end (alert sent), a lock held elsewhere, and the hold file. `tsc` now matches the pure base exactly (orchestrator 3, backend 4 pre-existing errors); `nest build` exits 0 for both and the compiled output contains the lock, the guard and `FOR SHARE`.
 
 Behaviour to know: when the owner's DRAFT waits behind the lock, the post is live and the workflow then records it as PUBLISHED; the alert tells the owner to correct it on the platform. Two publishes of the same post can still run in parallel (no idempotency ledger; option B was deferred).
+
+## Parity with the production worker — 2026-11-10
+
+Production runs image `postiz:sma053-worker-v2-20261105`. Its compiled files were hashed read-only inside the running container on schedule-post and match the captures used here. A `nest build` of the pure base `0d486f75` on coder-dsh reproduces production byte for byte for `posts.repository.js`, `posts.service.js`, `social.abstract.js` and `threads.provider.js`, so the build is reproducible and production differs from upstream only in the workflow and the activity.
+
+- **Workflow:** after bracing four guard returns (`a740a809`), the branch compiles to `post.workflow.v1.1.2.js` SHA-256 `c84c5194e6252b72d1ecd07157761026cbc185b8ad6ee39e5fdddf4cdafd6454`, identical to production. Deploying this branch does not change the workflow code, so running and recorded histories replay on exactly the code they ran on.
+- **Activity:** production's compiled activity is the base plus one root re-read before the provider call that throws a plain `Error` named `ApplicationFailure` with `nonRetryable` set as a property. Temporal treats a plain `Error` as retryable, so that stop is retried rather than stopping at once. This branch replaces it with the chain guard and a real non-retryable `bad_body` failure.
+- **Libraries:** repository, posts service, `social.abstract` and the Threads provider differ from production only by this branch's additions.
+
+Not done in this step: building a full Postiz image (the type-guard derived image and this compiled orchestrator would be combined on the production host at deploy time, as on 2026-11-05) and running the draft-safety verifier against it.
